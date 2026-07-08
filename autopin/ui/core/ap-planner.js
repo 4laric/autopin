@@ -170,6 +170,30 @@ class AutoPinPlannerSingleton {
         tryLog("typeof UISelection", () => typeof UISelection);
         tryLog("InterfaceMode.getCurrent", () =>
             (typeof InterfaceMode !== "undefined") ? InterfaceMode.getCurrent?.() : "no InterfaceMode global");
+        // Input context enumeration — needed to bind hotkeys to the city view.
+        tryLog("typeof Input", () => typeof Input);
+        tryLog("Input context methods", () => {
+            if (typeof Input === "undefined") { return "no Input"; }
+            const names = new Set();
+            let o = Input;
+            while (o && o !== Object.prototype) {
+                for (const n of Object.getOwnPropertyNames(o)) { names.add(n); }
+                o = Object.getPrototypeOf(o);
+            }
+            return [...names].filter(n => /context/i.test(n)).sort();
+        });
+        tryLog("Input.getActiveContext", () =>
+            (typeof Input !== "undefined" && Input.getActiveContext) ? Input.getActiveContext() : "n/a");
+        tryLog("Input contexts list", () => {
+            if (typeof Input === "undefined" || !Input.getNumContexts) { return "n/a"; }
+            const n = Input.getNumContexts();
+            const out = [];
+            for (let i = 0; i < n; i++) {
+                try { out.push(Input.getContextName ? Input.getContextName(i) : i); }
+                catch (e) { out.push("err" + i); }
+            }
+            return out;
+        });
         // The method surface of UI.Player — reveals the exact selection getters.
         tryLog("UI.Player methods", () => {
             if (!UI?.Player) { return "no UI.Player"; }

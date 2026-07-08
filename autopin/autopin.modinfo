@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Mod id="autopin" version="4" xmlns="ModInfo">
+    <Properties>
+        <Name>LOC_MOD_AUTOPIN_NAME</Name>
+        <Description>LOC_MOD_AUTOPIN_DESCRIPTION</Description>
+        <Authors>Alaric</Authors>
+        <Package>Mod</Package>
+        <AffectsSavedGames>0</AffectsSavedGames>
+    </Properties>
+    <Dependencies>
+        <Mod id="base-standard" title="LOC_MODULE_BASE_STANDARD_NAME" />
+        <Mod id="detailed-map-tacks" title="LOC_MOD_DETAILED_MAP_TACKS_NAME" />
+    </Dependencies>
+    <ActionCriteria>
+        <Criteria id="always">
+            <AlwaysMet></AlwaysMet>
+        </Criteria>
+    </ActionCriteria>
+    <ActionGroups>
+        <ActionGroup id="shell-autopin" scope="shell" criteria="always">
+            <Actions>
+                <UIScripts>
+                    <Item>ui/options/editors/ap-editor-keyboard-mapping-decorator.js</Item>
+                </UIScripts>
+                <UpdateDatabase>
+                    <Item>config/Input.xml</Item>
+                </UpdateDatabase>
+                <UpdateText>
+                    <Item>text/en_us/InputText.xml</Item>
+                </UpdateText>
+            </Actions>
+        </ActionGroup>
+        <ActionGroup id="game-autopin" scope="game" criteria="always">
+            <Actions>
+                <UIScripts>
+                    <Item>ui/input/ap-hotkey-manager.js</Item>
+                    <Item>ui/core/ap-planner.js</Item>
+                    <Item>ui/options/editors/ap-editor-keyboard-mapping-decorator.js</Item>
+                </UIScripts>
+                <UpdateText>
+                    <Item>text/en_us/InputText.xml</Item>
+                    <Item>text/en_us/UIText.xml</Item>
+                </UpdateText>
+            </Actions>
+        </ActionGroup>
+    </ActionGroups>
+    <LocalizedText>
+        <File>text/en_us/ModuleText.xml</File>
+    </LocalizedText>
+</Mod>

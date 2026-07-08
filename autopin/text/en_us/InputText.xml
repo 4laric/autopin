@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Database>
+    <EnglishText>
+        <Row Tag="LOC_AUTOPIN_GENERATE">
+            <Text>AutoPin: Generate Building Pins</Text>
+        </Row>
+        <Row Tag="LOC_AUTOPIN_GENERATE_DESCRIPTION">
+            <Text>Automatically place map tacks for optimal building placement in your cities.</Text>
+        </Row>
+        <Row Tag="LOC_AUTOPIN_CLEAR">
+            <Text>AutoPin: Clear Generated Pins</Text>
+        </Row>
+        <Row Tag="LOC_AUTOPIN_CLEAR_DESCRIPTION">
+            <Text>Remove all map tacks previously placed by AutoPin.</Text>
+        </Row>
+        <Row Tag="LOC_AUTOPIN_SETTLE">
+            <Text>AutoPin: Suggest Settlements</Text>
+        </Row>
+        <Row Tag="LOC_AUTOPIN_SETTLE_DESCRIPTION">
+            <Text>Place city-center map tacks at the best nearby settlement locations, ranked by the value of the building plan each spot allows.</Text>
+        </Row>
+    </EnglishText>
+</Database>

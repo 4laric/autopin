@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Database>
+    <EnglishText>
+        <Row Tag="LOC_AUTOPIN_GENERATED_PINS">
+            <Text>AutoPin placed {1_Count} building pins.</Text>
+        </Row>
+        <Row Tag="LOC_AUTOPIN_CLEARED_PINS">
+            <Text>AutoPin removed {1_Count} building pins.</Text>
+        </Row>
+    </EnglishText>
+</Database>

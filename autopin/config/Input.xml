@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Database>
+    <InputActions>
+        <Row ActionId="autopin-generate" DeviceType="Keyboard" Name="LOC_AUTOPIN_GENERATE" Description="LOC_AUTOPIN_GENERATE_DESCRIPTION"/>
+        <Row ActionId="autopin-clear" DeviceType="Keyboard" Name="LOC_AUTOPIN_CLEAR" Description="LOC_AUTOPIN_CLEAR_DESCRIPTION"/>
+        <Row ActionId="autopin-settle" DeviceType="Keyboard" Name="LOC_AUTOPIN_SETTLE" Description="LOC_AUTOPIN_SETTLE_DESCRIPTION"/>
+    </InputActions>
+    <InputContextConstraints>
+        <Row ActionId="autopin-generate" ContextId="World"/>
+        <Row ActionId="autopin-clear" ContextId="World"/>
+        <Row ActionId="autopin-settle" ContextId="World"/>
+    </InputContextConstraints>
+    <InputActionDefaultGestures>
+        <Row ActionId="autopin-generate" Index="0" GestureType="KBMouse" GestureData="KEY_F3" />
+        <Row ActionId="autopin-clear" Index="0" GestureType="KBMouse" GestureData="KEY_F4" />
+        <Row ActionId="autopin-settle" Index="0" GestureType="KBMouse" GestureData="KEY_F6" />
+    </InputActionDefaultGestures>
+</Database>

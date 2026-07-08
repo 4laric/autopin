@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Database>
+    <EnglishText>
+        <Row Tag="LOC_MOD_AUTOPIN_NAME">
+            <Text>AutoPin</Text>
+        </Row>
+        <Row Tag="LOC_MOD_AUTOPIN_DESCRIPTION">
+            <Text>Automatically places map tacks for optimal building placement, maximizing adjacency yields. Built on wltk's Detailed Map Tacks (required).</Text>
+        </Row>
+    </EnglishText>
+</Database>

@@ -194,6 +194,26 @@ class AutoPinPlannerSingleton {
             }
             return out;
         });
+        // getHeadSelectedCity is null even in the Panel (city view) context,
+        // so hunt for where the currently-viewed city actually lives.
+        const surface = (obj, re) => {
+            if (!obj) { return "n/a"; }
+            const names = new Set();
+            let o = obj;
+            while (o && o !== Object.prototype) {
+                for (const n of Object.getOwnPropertyNames(o)) { names.add(n); }
+                o = Object.getPrototypeOf(o);
+            }
+            return [...names].filter(n => re.test(n)).sort();
+        };
+        tryLog("UI surface", () => (typeof UI !== "undefined") ? surface(UI, /city|select|plot|focus|current|view|cursor|hover/i) : "no UI");
+        tryLog("UI.Player.getHeadSelectedUnit", () => UI?.Player?.getHeadSelectedUnit?.());
+        tryLog("typeof Camera", () => typeof Camera);
+        tryLog("Camera surface", () => (typeof Camera !== "undefined") ? surface(Camera, /plot|focus|target|look|pos|world|coord/i) : "no Camera");
+        tryLog("typeof ContextManager", () => typeof ContextManager);
+        tryLog("ContextManager surface", () => (typeof ContextManager !== "undefined") ? surface(ContextManager, /city|current|screen|target|id/i) : "no ContextManager");
+        tryLog("typeof CityManager", () => typeof CityManager);
+        tryLog("CityManager surface", () => (typeof CityManager !== "undefined") ? surface(CityManager, /select|current|city|id/i) : "no CityManager");
         // The method surface of UI.Player — reveals the exact selection getters.
         tryLog("UI.Player methods", () => {
             if (!UI?.Player) { return "no UI.Player"; }

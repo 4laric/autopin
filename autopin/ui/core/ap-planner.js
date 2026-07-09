@@ -102,13 +102,17 @@ class AutoPinPlannerSingleton {
         engine.whenReady.then(() => { this.onReady(); });
     }
     onReady() {
-        window.addEventListener("hotkey-autopin-generate", this.generate.bind(this));
-        window.addEventListener("hotkey-autopin-settle", this.suggestSettlements.bind(this));
-        window.addEventListener("hotkey-autopin-clear", this.clearAll.bind(this));
+        window.addEventListener("hotkey-autopin-generate", () => this.runAction("generate"));
+        window.addEventListener("hotkey-autopin-settle", () => this.runAction("settle"));
+        window.addEventListener("hotkey-autopin-clear", () => this.runAction("clear"));
         // The game fires CitySelectionChanged on the engine bus when a city is
         // selected/opened (getHeadSelectedCity() is null from this detached
         // hotkey handler). Cache the id so F3 can target that city.
         engine.on('CitySelectionChanged', this.onCitySelectionChanged.bind(this));
+        // Fallback so the hotkeys work even while a modal screen (e.g. the city
+        // production panel) is open and consuming the game's input actions:
+        // a capture-phase DOM keydown listener runs before the screen handlers.
+        window.addEventListener("keydown", this.onKeyDown.bind(this), true);
     }
 
     /**
@@ -128,6 +132,36 @@ class AutoPinPlannerSingleton {
 
     /* ---------------------------------------------------------- entry points */
 
+    /**
+     * Debounced dispatch shared by the input-action hotkeys and the DOM keydown
+     * fallback, so one keypress that arrives via both paths only runs once.
+     */
+    runAction(name) {
+        const now = Date.now();
+        if (this._lastAction && this._lastAction.name == name && (now - this._lastAction.t) < 400) {
+            return;
+        }
+        this._lastAction = { name, t: now };
+        if (name == "generate") { this.generate(); }
+        else if (name == "clear") { this.clearAll(); }
+        else if (name == "settle") { this.suggestSettlements(); }
+    }
+    /**
+     * Capture-phase keydown fallback. The input-action system doesn't deliver
+     * our hotkeys while a modal screen (the city production panel) is focused,
+     * because that screen consumes input first. Catching keydown in the capture
+     * phase lets F3/F4/F6 work there too. Uses the default keys.
+     */
+    onKeyDown(e) {
+        const key = e?.key || e?.code;
+        const map = { F3: "generate", F4: "clear", F6: "settle" };
+        const action = map[key];
+        if (!action) {
+            return;
+        }
+        try { e.preventDefault(); e.stopPropagation(); } catch (_) { /* ignore */ }
+        this.runAction(action);
+    }
     generate() {
         this.runBanner("generate");
         try {

@@ -214,6 +214,9 @@ class AutoPinPlannerSingleton {
         tryLog("ContextManager surface", () => (typeof ContextManager !== "undefined") ? surface(ContextManager, /city|current|screen|target|id/i) : "no ContextManager");
         tryLog("typeof CityManager", () => typeof CityManager);
         tryLog("CityManager surface", () => (typeof CityManager !== "undefined") ? surface(CityManager, /select|current|city|id/i) : "no CityManager");
+        tryLog("Camera.getCurrentPose", () => Camera?.getCurrentPose?.());
+        tryLog("Camera.pickPlot", () => Camera?.pickPlot?.());
+        tryLog("Camera.pickWorldPos", () => Camera?.pickWorldPos?.());
         // The method surface of UI.Player — reveals the exact selection getters.
         tryLog("UI.Player methods", () => {
             if (!UI?.Player) { return "no UI.Player"; }

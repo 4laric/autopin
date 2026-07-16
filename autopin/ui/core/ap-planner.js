@@ -195,6 +195,10 @@ class AutoPinPlannerSingleton {
     constructor() {
         this.catalog = new Catalog("APN");
         this.runWonderCount = 0;
+        // Cached id of the last selected city (upstream): getHeadSelectedCity()
+        // reads null from the detached hotkey handler, so we track it via the
+        // CitySelectionChanged event instead.
+        this.selectedCityID = null;
         // Per-city map of base-building -> number of gated upgrades still in
         // play, read by evaluatePlacements for the gateway bonus. Set at the
         // top of planCity, cleared where non-plan scoring runs (settlements).
@@ -208,9 +212,17 @@ class AutoPinPlannerSingleton {
         engine.whenReady.then(() => { this.onReady(); });
     }
     onReady() {
-        window.addEventListener("hotkey-autopin-generate", this.generate.bind(this));
-        window.addEventListener("hotkey-autopin-settle", this.suggestSettlements.bind(this));
-        window.addEventListener("hotkey-autopin-clear", this.clearAll.bind(this));
+        window.addEventListener("hotkey-autopin-generate", () => this.runAction("generate"));
+        window.addEventListener("hotkey-autopin-settle", () => this.runAction("settle"));
+        window.addEventListener("hotkey-autopin-clear", () => this.runAction("clear"));
+        // The game fires CitySelectionChanged on the engine bus when a city is
+        // selected/opened (getHeadSelectedCity() is null from this detached
+        // hotkey handler). Cache the id so F3 can target that city.
+        engine.on('CitySelectionChanged', this.onCitySelectionChanged.bind(this));
+        // Fallback so the hotkeys work even while a modal screen (e.g. the city
+        // production panel) is open and consuming the game's input actions:
+        // a capture-phase DOM keydown listener runs before the screen handlers.
+        window.addEventListener("keydown", this.onKeyDown.bind(this), true);
     }
 
     /**
@@ -230,13 +242,39 @@ class AutoPinPlannerSingleton {
 
     /* ---------------------------------------------------------- entry points */
 
+    /**
+     * Debounced dispatch shared by the input-action hotkeys and the DOM keydown
+     * fallback, so one keypress that arrives via both paths only runs once.
+     */
+    runAction(name) {
+        const now = Date.now();
+        if (this._lastAction && this._lastAction.name == name && (now - this._lastAction.t) < 400) {
+            return;
+        }
+        this._lastAction = { name, t: now };
+        if (name == "generate") { this.generate(); }
+        else if (name == "clear") { this.clearAll(); }
+        else if (name == "settle") { this.suggestSettlements(); }
+    }
+    /**
+     * Capture-phase keydown fallback. The input-action system doesn't deliver
+     * our hotkeys while a modal screen (the city production panel) is focused,
+     * because that screen consumes input first. Catching keydown in the capture
+     * phase lets F3/F4/F6 work there too. Uses the default keys.
+     */
+    onKeyDown(e) {
+        const key = e?.key || e?.code;
+        const map = { F3: "generate", F4: "clear", F6: "settle" };
+        const action = map[key];
+        if (!action) {
+            return;
+        }
+        try { e.preventDefault(); e.stopPropagation(); } catch (_) { /* ignore */ }
+        this.runAction(action);
+    }
     generate() {
         this.runBanner("generate");
         try {
-            // TEMP DIAGNOSTIC: dump the selection API surface so we can find the
-            // call that actually reports the selected/viewed city (head-selected
-            // city has been coming back null). Remove once the right API is known.
-            this.probeSelection();
             // With a city selected, re-plan just that city; otherwise, all.
             const selected = this.getSelectedCityCenter();
             if (selected) {
@@ -251,43 +289,6 @@ class AutoPinPlannerSingleton {
         } finally {
             this.runBannerEnd("generate");
         }
-    }
-    /**
-     * TEMP DIAGNOSTIC. Logs what several plausible selection APIs return and
-     * the method surface of UI.Player / UISelection, so the real "currently
-     * selected/viewed city" call can be identified from the log. No behavior
-     * depends on this; it's pure logging.
-     */
-    probeSelection() {
-        const tryLog = (label, fn) => {
-            try {
-                const v = fn();
-                console.error(`[AutoPin] probe ${label} = ${JSON.stringify(v)}`);
-                return v;
-            } catch (e) {
-                console.error(`[AutoPin] probe ${label} -> ERROR ${e}`);
-                return undefined;
-            }
-        };
-        tryLog("UI.Player.getHeadSelectedCity", () => UI?.Player?.getHeadSelectedCity?.());
-        tryLog("UI.Player.getHeadSelectedPlot", () => UI?.Player?.getHeadSelectedPlot?.());
-        tryLog("UI.Player.getHeadSelectedUnit", () => UI?.Player?.getHeadSelectedUnit?.());
-        tryLog("UI.Player.getSelectedCity", () => UI?.Player?.getSelectedCity?.());
-        tryLog("typeof Cities", () => typeof Cities);
-        tryLog("typeof UISelection", () => typeof UISelection);
-        tryLog("InterfaceMode.getCurrent", () =>
-            (typeof InterfaceMode !== "undefined") ? InterfaceMode.getCurrent?.() : "no InterfaceMode global");
-        // The method surface of UI.Player — reveals the exact selection getters.
-        tryLog("UI.Player methods", () => {
-            if (!UI?.Player) { return "no UI.Player"; }
-            const names = new Set();
-            let o = UI.Player;
-            while (o && o !== Object.prototype) {
-                for (const n of Object.getOwnPropertyNames(o)) { names.add(n); }
-                o = Object.getPrototypeOf(o);
-            }
-            return [...names].filter(n => /select|city|plot|unit|focus/i.test(n)).sort();
-        });
     }
     generateForAll() {
         // Regenerate from a clean slate so plans reflect the current map.
@@ -351,68 +352,71 @@ class AutoPinPlannerSingleton {
         console.error(`[AutoPin] re-planned selected city: ${res.pinned.length} pins from ${res.full.length} planned.`);
     }
     /**
-     * Center of the currently selected city, or null if none is selected (or
-     * the selection API isn't available — then we fall back to all cities).
+     * Center of the currently selected city, or null if none.
      *
-     * Resolution deliberately goes through the LOCAL PLAYER'S OWN city list
-     * rather than a global `Cities` accessor. The previous implementation did
-     * `Cities.get?.(cityID)`, but optional chaining only guards the property
-     * access — if the `Cities` global isn't defined in this game-scope UI
-     * context, the bare reference throws a ReferenceError that the catch
-     * swallows, so a selected city was NEVER detected and F3 always fell back
-     * to the (now impractical) global plan. Matching the head-selected
-     * ComponentID against `player.Cities.getCities()` uses only APIs already
-     * proven to work elsewhere in this file.
+     * getHeadSelectedCity() returns null when called from this detached global
+     * hotkey handler, so the reliable signal is the CitySelectionChanged engine
+     * event (payload { cityID }) which we cache in this.selectedCityID. Resolve
+     * that id to a location via Cities.get, falling back to matching our own
+     * city list, and to a live getHeadSelectedCity() read if the cache is empty.
      */
     getSelectedCityCenter() {
         try {
-            const selectedID = UI.Player?.getHeadSelectedCity?.();
-            // Dump the raw id so the console tells us whether the game even
-            // reports a selected city (and in what shape) when F3 is pressed.
-            console.error(`[AutoPin] head-selected city id: ${JSON.stringify(selectedID)}`);
-            // getHeadSelectedCity returns a ComponentID object even when nothing
-            // is selected (an *invalid* one), so a truthiness check isn't enough.
-            // Validate when the helper exists; if it doesn't, don't block on it.
-            const invalid = !selectedID
-                || (typeof ComponentID !== "undefined"
-                    && ComponentID?.isValid
-                    && !ComponentID.isValid(selectedID));
+            let id = this.selectedCityID;
+            if (!id) {
+                const live = UI?.Player?.getHeadSelectedCity?.();
+                if (live) { id = live; }
+            }
+            const invalid = !id
+                || (typeof ComponentID !== "undefined" && ComponentID?.isValid && !ComponentID.isValid(id));
             if (invalid) {
-                console.error("[AutoPin] no valid selected-city id — nothing selected, or the selection isn't a city.");
                 return null;
             }
-            // Path 1: the documented global accessor, Cities.get(id). `typeof`
-            // guards the identifier itself (a bare `Cities.get?.()` throws a
-            // ReferenceError if the global is absent, which is the bug that
-            // used to silently force the all-cities fallback).
+            // Documented accessor first.
             if (typeof Cities !== "undefined" && Cities?.get) {
-                const loc = Cities.get(selectedID)?.location;
+                const loc = Cities.get(id)?.location;
                 if (loc) {
                     console.error(`[AutoPin] resolved selected city via Cities.get -> ${loc.x},${loc.y}`);
                     return { x: loc.x, y: loc.y };
                 }
             }
-            // Path 2: match the id against our own city list. Compare owner+id
-            // fields directly so we don't depend on `city.id` being a
-            // ComponentID or on ComponentID.isMatch existing.
+            // Fallback: match our own city list by owner+id.
             const player = Players.get(GameContext.localPlayerID);
             const cities = player?.Cities?.getCities?.() || [];
             for (const city of cities) {
                 const cid = city?.id;
                 const match = cid && (
-                    (typeof ComponentID !== "undefined" && ComponentID?.isMatch?.(cid, selectedID))
-                    || (cid.id === selectedID.id && cid.owner === selectedID.owner)
+                    (typeof ComponentID !== "undefined" && ComponentID?.isMatch?.(cid, id))
+                    || (cid.id === id.id && cid.owner === id.owner)
                 );
                 if (match && city.location) {
                     console.error(`[AutoPin] resolved selected city via player city list -> ${city.location.x},${city.location.y}`);
                     return { x: city.location.x, y: city.location.y };
                 }
             }
-            console.error("[AutoPin] selected-city id present but could not be resolved to a location.");
+            console.error("[AutoPin] a city id is selected but could not be resolved to a location.");
         } catch (e) {
             console.error(`[AutoPin] selected-city detection failed: ${e}\n${e?.stack}`);
         }
         return null;
+    }
+    /**
+     * Track the selected city via the engine's CitySelectionChanged event
+     * (payload { cityID }) — the same signal the game's own city screens use.
+     * Store a valid id; clear on deselection so F3 with no city plans all.
+     */
+    onCitySelectionChanged(data) {
+        try {
+            const cityID = data?.cityID;
+            const valid = cityID
+                && (typeof ComponentID === "undefined"
+                    || !ComponentID?.isValid
+                    || ComponentID.isValid(cityID));
+            this.selectedCityID = valid ? cityID : null;
+            console.error(`[AutoPin] CitySelectionChanged -> ${JSON.stringify(this.selectedCityID)}`);
+        } catch (e) {
+            console.error(`[AutoPin] CitySelectionChanged handler error: ${e}`);
+        }
     }
     suggestSettlements() {
         this.runBanner("settle");

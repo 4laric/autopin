@@ -7,8 +7,14 @@
     </InputActions>
     <InputContextConstraints>
         <Row ActionId="autopin-generate" ContextId="World"/>
+        <Row ActionId="autopin-generate" ContextId="Panel"/>
+        <Row ActionId="autopin-generate" ContextId="Unit"/>
         <Row ActionId="autopin-clear" ContextId="World"/>
+        <Row ActionId="autopin-clear" ContextId="Panel"/>
+        <Row ActionId="autopin-clear" ContextId="Unit"/>
         <Row ActionId="autopin-settle" ContextId="World"/>
+        <Row ActionId="autopin-settle" ContextId="Panel"/>
+        <Row ActionId="autopin-settle" ContextId="Unit"/>
     </InputContextConstraints>
     <InputActionDefaultGestures>
         <Row ActionId="autopin-generate" Index="0" GestureType="KBMouse" GestureData="KEY_F3" />

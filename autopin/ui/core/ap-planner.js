@@ -870,9 +870,11 @@ class AutoPinPlannerSingleton {
      * neighbors for the next round.
      */
     isUrbanReachable(plot) {
-        // A tile that is already (planned) urban can take its second building.
+        // An already-urban tile (a building sits there) can take its second
+        // building, and the city center can take a building to form the capital
+        // quarter — both are directly reachable.
         const own = MapTackUtils.getRealizedPlotDetails(plot.x, plot.y);
-        if (own?.district == "DISTRICT_URBAN") {
+        if (own?.district == "DISTRICT_URBAN" || own?.district == "DISTRICT_CITY_CENTER") {
             return true;
         }
         const neighbors = MapTackUtils.getAdjacentPlotDetails(plot.x, plot.y) || [];
@@ -1523,25 +1525,31 @@ class AutoPinPlannerSingleton {
         for (const plotIndex of plotIndices) {
             const loc = GameplayMap.getLocationFromIndex(plotIndex);
             const x = loc.x, y = loc.y;
-            if (x == center.x && y == center.y) {
-                continue; // city center itself
-            }
+            // The city center itself IS a build tile in Civ 7: the Palace shares
+            // the tile and one more building can join it to form the capital
+            // quarter — prime specialist real estate. Include it (DMT's validator
+            // still gates whether a building slot is actually free), rather than
+            // skipping it as this planner did since inception.
+            const isCenter = (x == center.x && y == center.y);
             // Nearest-center ownership: when other plan centers exist, only keep
             // a plot if THIS center is the closest to it. This partitions the
             // overlap zone between adjacent cities so no tile is planned twice.
-            if (otherCenters.length && !this.plotBelongsToCenter(x, y, center, otherCenters)) {
+            // The center always belongs to itself, so it's exempt.
+            if (!isCenter && otherCenters.length && !this.plotBelongsToCenter(x, y, center, otherCenters)) {
                 continue;
             }
             // Skip plots owned by someone else; remember which ones are ours.
-            let owned = false;
-            try {
-                const owner = GameplayMap.getOwner(x, y);
-                if (owner != null && owner != -1 && owner != localPlayerID) {
-                    continue;
-                }
-                owned = owner == localPlayerID;
-            } catch (e) { /* unowned/fogged plots are fine to plan on */ }
-            plots.push({ x, y, owned });
+            let owned = isCenter; // we always own our own city center
+            if (!isCenter) {
+                try {
+                    const owner = GameplayMap.getOwner(x, y);
+                    if (owner != null && owner != -1 && owner != localPlayerID) {
+                        continue;
+                    }
+                    owned = owner == localPlayerID;
+                } catch (e) { /* unowned/fogged plots are fine to plan on */ }
+            }
+            plots.push({ x, y, owned, isCenter });
         }
         return plots;
     }
@@ -1573,10 +1581,11 @@ class AutoPinPlannerSingleton {
      * within the candidate plots are skipped.
      */
     getCandidateBuildings(plots, center = null) {
-        // Types already realized (built or pinned) on these plots. The city
-        // center tile is included in this sweep — buildings like the monument
-        // often live in the center's slots — even though it's never a
-        // placement candidate itself.
+        // Types already realized (built or pinned) on these plots, including the
+        // city center tile — buildings like the monument often live in the
+        // center's slots, and those types must be excluded from candidates so we
+        // don't re-plan them. (The center is now also a placement candidate for
+        // its free quarter slot; plots already includes it, hence the dedupe.)
         const usedTypes = new Set();
         const sweepPlots = center ? [center, ...plots] : plots;
         for (const plot of sweepPlots) {
@@ -1674,7 +1683,11 @@ class AutoPinPlannerSingleton {
                 if (!cls) {
                     continue; // unclassified -> its own singleton, no ordering
                 }
-                info.set(c.type, { dist: c.dist, strength: this.getAdjacencyStrength(c.type) });
+                info.set(c.type, {
+                    dist: c.dist,
+                    cost: this.getBuildingCost(c.type),
+                    strength: this.getAdjacencyStrength(c.type)
+                });
                 if (!byClass.has(cls)) {
                     byClass.set(cls, []);
                 }
@@ -1687,12 +1700,20 @@ class AutoPinPlannerSingleton {
                 types.sort((a, b) => {
                     const ia = info.get(a), ib = info.get(b);
                     if (ia.dist != ib.dist) {
-                        return ia.dist - ib.dist;       // unlocks earlier -> base
+                        return ia.dist - ib.dist;         // unlocks earlier -> base
+                    }
+                    // Production cost is the reliable base-vs-upgrade signal when
+                    // tech distance ties (e.g. both unresearched at game start):
+                    // the cheaper building is the base. Adjacency "strength" is
+                    // NOT — it mis-ranked Academy under Library in live logs, so
+                    // it's only a last resort when costs are equal/unavailable.
+                    if (ia.cost != ib.cost) {
+                        return ia.cost - ib.cost;         // cheaper -> base
                     }
                     if (ia.strength != ib.strength) {
                         return ia.strength - ib.strength; // weaker -> base
                     }
-                    return a < b ? -1 : 1;              // deterministic tiebreak
+                    return a < b ? -1 : 1;                // deterministic tiebreak
                 });
                 // Every earlier-ranked sibling is a predecessor (build the
                 // whole line as a contiguous prefix, weakest first).
@@ -1811,6 +1832,24 @@ class AutoPinPlannerSingleton {
             }
         } catch (e) { /* no adjacency data -> strength 0 */ }
         return s;
+    }
+
+    /**
+     * Base production cost of a building from GameInfo.Constructibles, memoized.
+     * Used to rank base-vs-upgrade within a yield-class line (cheaper = base).
+     * Returns 0 if the Cost column isn't readable, in which case ranking falls
+     * back to the adjacency-strength tiebreak.
+     */
+    getBuildingCost(type) {
+        if (!this._costCache) {
+            this._costCache = new Map();
+            try {
+                for (const e of (GameInfo.Constructibles || [])) {
+                    this._costCache.set(e.ConstructibleType, Number(e.Cost) || 0);
+                }
+            } catch (e) { /* no Constructibles table -> all costs 0 */ }
+        }
+        return this._costCache.get(type) || 0;
     }
 
     /**

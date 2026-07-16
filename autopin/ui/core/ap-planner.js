@@ -583,6 +583,11 @@ class AutoPinPlannerSingleton {
             .filter(([, preds]) => preds.length)
             .map(([t, preds]) => `${t}<-[${preds.join(",")}]`).join("; ");
         console.error(`[AutoPin] ${center.x},${center.y} building lines: ${lineLog || "none"}`);
+        // Diagnostic: for each tile that already holds a building (the center's
+        // Palace included), report whether DMT's validator would accept ANOTHER
+        // building there. Tells us if the "won't complete quarters on occupied
+        // tiles" symptom is DMT gating (valid=false) vs. our own logic.
+        this.logOccupiedTileDiagnostic(center, plots, remaining.map(c => c.type));
         // Per-type ETA (build-slots to unlock) — also used to tag stored records.
         const etaSlots = new Map();
         for (const c of remaining) {
@@ -1096,6 +1101,43 @@ class AutoPinPlannerSingleton {
             console.error(`[AutoPin] relocation pass: applied ${improved} swap(s).`);
         }
         return pins;
+    }
+
+    /**
+     * Diagnostic (no behavior): for every candidate tile that already holds at
+     * least one building — the city center's Palace included — log whether DMT's
+     * validator will accept a further building there, testing the first pool type
+     * that reports a verdict. If occupied tiles come back valid=false, DMT is
+     * gating quarter-completion; if valid=true, the gap is our placement logic.
+     */
+    logOccupiedTileDiagnostic(center, plots, poolTypes) {
+        try {
+            const lines = [];
+            for (const plot of plots) {
+                const details = MapTackUtils.getRealizedPlotDetails(plot.x, plot.y);
+                const built = details?.constructibles || [];
+                if (built.length == 0) {
+                    continue; // empty tile — not what we're probing
+                }
+                let verdict = "no pool type testable";
+                for (const type of poolTypes) {
+                    let v;
+                    try {
+                        v = MapTackValidator.isValid(plot.x, plot.y, type);
+                    } catch (e) {
+                        continue;
+                    }
+                    verdict = `${type} valid=${v.isValid} prevent=${v.preventPlacement}`;
+                    break; // one representative verdict per tile is enough
+                }
+                const tag = plot.isCenter ? " CENTER" : "";
+                lines.push(`(${plot.x},${plot.y})${tag}[${built.join(",")}] -> ${verdict}`);
+            }
+            console.error(`[AutoPin] ${center.x},${center.y} occupied-tile check: `
+                + (lines.length ? lines.join(" | ") : "no occupied tiles in range"));
+        } catch (e) {
+            console.error(`[AutoPin] occupied-tile diagnostic failed: ${e}`);
+        }
     }
 
     /**

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Mod id="autopin" version="10" xmlns="ModInfo">
+<Mod id="autopin" version="11" xmlns="ModInfo">
     <Properties>
         <Name>LOC_MOD_AUTOPIN_NAME</Name>
         <Description>LOC_MOD_AUTOPIN_DESCRIPTION</Description>
@@ -35,6 +35,8 @@
                 <UIScripts>
                     <Item>ui/input/ap-hotkey-manager.js</Item>
                     <Item>ui/core/ap-planner.js</Item>
+                    <Item>ui/ap-advisor-hook.js</Item>
+                    <Item>ui/ap-plan-panel.js</Item>
                     <Item>ui/options/editors/ap-editor-keyboard-mapping-decorator.js</Item>
                 </UIScripts>
                 <UpdateText>

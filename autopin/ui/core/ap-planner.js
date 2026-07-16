@@ -47,6 +47,75 @@ const PLAN_WAVES = [
     { maxTechDistance: Infinity, budget: 3, ownedOnly: false }, // horizon: rest of the age
 ];
 
+// ---- Lifetime sequence planning (M2) ------------------------------------
+// When true, planCity replaces the capped waves above with a SINGLE beam over
+// the whole current-age pool, scoring each placement by its raw value times a
+// time discount (gamma^slotTime). This makes tile choices for deep-tech
+// buildings visible to the placement of early ones (endgame-aware layout),
+// while the discount naturally orders now-buildable buildings to the front and
+// tech-gated ones to the back — as one contiguous, build-order-valid sequence.
+// Set false to fall straight back to the wave planner (identical to M1).
+const USE_LIFETIME_SEQUENCE = true;
+// Per-build-slot discount. A pin coming online ~slotTime slots from now is
+// worth gamma^slotTime of its raw value. Lower = more myopic (favor now).
+const LIFETIME_GAMMA = 0.92;
+// How many pins the single sequence places. Kept near the old wave total
+// (8+3+3) for now; windowed pinning of a longer plan is M3.
+const LIFETIME_BUDGET = 16;
+// Tiles the settlement doesn't own yet are further off — add this many slots
+// of delay to placements on them, so the plan front-loads owned tiles and
+// treats unowned ones as "grow here, then build". A simple stand-in for the
+// full acquisition model in M3.
+const UNOWNED_SLOT_PENALTY = 2;
+// Map techDistance {0,1,2} -> estimated build-slots until unlock. This is the
+// coarse clock: the finer node-cost/science-rate ETA (design M0/R2) needs
+// GameInfo tables not yet verified from inside the game, so the sequence runs
+// on buckets by default and sharpens later without changing the algorithm.
+const TECH_DIST_SLOTS = [0, 3, 8];
+
+// ---- Windowed lifetime plan (M3) ----------------------------------------
+// The lifetime sequence is computed in full and STORED, but only a near-term
+// window (plus permanent anchors) is physically pinned, so the map isn't
+// buried by a whole age of tacks. F3 recomputes: already-built buildings drop
+// out of the candidate pool automatically, so the window advances on its own.
+// Hard cap on how many buildings the sequence plans (was LIFETIME_BUDGET).
+const LIFETIME_MAX_PINS = 30;
+// Stop extending the sequence once the best next building adds less than this
+// (discounted) score — the plan's length becomes data-driven rather than a
+// flat budget. 0 disables the floor (plan to the hard cap).
+const LIFETIME_MARGINAL_FLOOR = 0.75;
+// How many buildings from the front of the (unbuilt) sequence to physically
+// pin. Anchors below are pinned regardless of position.
+const WINDOW_SIZE = 8;
+// Ageless buildings are permanent (never overbuilt), so their placement is
+// forever — pin them even when they sit deep in the sequence, so the reserved
+// tile is visible now. (Wonders are always pinned in their own phase.)
+const PIN_AGELESS_ANCHORS = true;
+// Plan-stability bias. On re-plan (F3), a building scored on the SAME tile it
+// occupied in the stored plan gets this bonus, so a new layout has to beat the
+// old placement by more than a rounding error to move it. Keeps quarters from
+// teleporting across the city on every regenerate.
+const STABILITY_BONUS = 1.5;
+
+// ---- Endgame-aware placement & polish (M4) ------------------------------
+// Permanence premium: Ageless and unique buildings are placed forever (never
+// overbuilt, can't be rebuilt elsewhere), so their placement value is scaled by
+// this — they win the best tiles over throwaway current-age buildings. 1 = off.
+const PERMANENCE_PREMIUM = 1.15;
+// Overbuild-fodder bias: a non-permanent (current-age, non-unique) building on
+// an adjacency-rich tile is worth a little extra, because next age's building
+// overbuilds it in place and inherits the tile's adjacencies (for the Meiji
+// endgame this is the actual win condition). Added as this fraction of the
+// placement's own adjacency value. Small on purpose; 0 = off. Validate the
+// magnitude in-game before leaning on it.
+const FODDER_ADJACENCY_FRACTION = 0.15;
+// Local-search relocation polish: after the beam, try swapping the tiles of
+// building pairs and keep swaps that raise total placement value. Catches the
+// residue greedy/beam leaves. Optimizes the raw per-tile proxy (no mutual-
+// adjacency/discount), so it only applies strict improvements and any imperfect
+// tile self-heals on the next F3. false = skip the pass.
+const ENABLE_RELOCATION_PASS = true;
+
 // Wonder-ambition damper: every wonder pinned during one generate run
 // multiplies the score of subsequent wonder candidates by this factor
 // (0.8^n after n wonders). You can't realistically race 10 wonders at once —
@@ -63,12 +132,22 @@ const WONDER_MIN_SCORE = 6;
 // this floor.
 const WAREHOUSE_MIN_SCORE = 3;
 
+// Line-order gateway bonus. A "base" building that still has unplaced higher-
+// tier siblings in its yield-class line (e.g. Library while Academy is
+// unbuilt) gets this much extra score per gated successor, so the base wins a
+// budget slot and actually unlocks the upgrade — instead of both losing the
+// race and leaving the science quarter empty. Pairs with the hard line-order
+// gate in beamSearch (which prevents the *orphan upgrade*, e.g. Academy with
+// no Library). Set to 0 to keep only the hard gate.
+const GATEWAY_BONUS = 2;
+
 // Beam search tuning. BEAM_WIDTH = 1 degenerates to plain greedy.
 const BEAM_WIDTH = 3;      // partial layouts kept alive per round
 const BEAM_EXTENSIONS = 6; // best extensions considered per layout per round
 const ID_AUTOPIN = "AUTOPIN_PINS";
-const KEY_PIN_LIST = "list";
-const KEY_SETTLE_LIST = "settle";
+const KEY_PIN_LIST = "list";      // physically placed pins (window + anchors) — what F4 clears
+const KEY_SETTLE_LIST = "settle"; // suggested city-center tacks
+const KEY_PLAN_FULL = "planfull"; // full ordered lifetime plan (metadata, incl. unpinned tail)
 
 // Settlement suggestion tuning.
 const MIN_SETTLE_DISTANCE = 4;   // plots from any existing/suggested center
@@ -78,14 +157,32 @@ const SETTLE_SUGGESTIONS = 3;    // city-center tacks to place
 const SETTLE_PLAN_ROUNDS = 4;    // buildings in the hypothetical plan
 
 // Yield weights used for scoring. Tweak to taste.
+//
+// Tuned for THE TENURE TRACK (Confucius / Han->Ming->Meiji, peaceful science
+// on Deity). The engine is: cram specialists into high-adjacency science
+// quarters (Keju = +2 Science/specialist), grow tall to place more of them,
+// and stay Happy enough on Deity to keep hiring. So:
+//   - SCIENCE dominates placement: build science-adjacency quarters, and
+//     settle where the best science city can be built (F6 uses this too).
+//   - FOOD is elevated: growth events are how specialists get placed, and
+//     specialists eat 2/4/6 food each. Food is the fuel, not an afterthought.
+//   - HAPPINESS is elevated: on Deity you get no happiness handout, and a
+//     specialist city that tips Unhappy stops the whole engine. Keep it high.
+//   - DIPLOMACY nudged up: your defense runs on Influence (War Support peace),
+//     so influence-yielding placements have real value in this build.
+//   - CULTURE / GOLD deprioritized: culture only paces civics here, and the
+//     build buys almost nothing with gold.
+// Original balanced defaults, for a quick revert:
+//   FOOD 1, PRODUCTION 1.1, GOLD 0.8, SCIENCE 1.2, CULTURE 1.2,
+//   HAPPINESS 0.9, DIPLOMACY 0.9
 const YIELD_WEIGHTS = {
-    YIELD_FOOD: 1,
-    YIELD_PRODUCTION: 1.1,
-    YIELD_GOLD: 0.8,
-    YIELD_SCIENCE: 1.2,
-    YIELD_CULTURE: 1.2,
-    YIELD_HAPPINESS: 0.9,
-    YIELD_DIPLOMACY: 0.9,
+    YIELD_FOOD: 1.3,
+    YIELD_PRODUCTION: 1.0,
+    YIELD_GOLD: 0.6,
+    YIELD_SCIENCE: 1.9,
+    YIELD_CULTURE: 0.9,
+    YIELD_HAPPINESS: 1.2,
+    YIELD_DIPLOMACY: 1.0,
 };
 
 class AutoPinPlannerSingleton {
@@ -98,6 +195,16 @@ class AutoPinPlannerSingleton {
     constructor() {
         this.catalog = new Catalog("APN");
         this.runWonderCount = 0;
+        // Per-city map of base-building -> number of gated upgrades still in
+        // play, read by evaluatePlacements for the gateway bonus. Set at the
+        // top of planCity, cleared where non-plan scoring runs (settlements).
+        this.gatewayCount = null;
+        // Per-city map of type -> {x,y} from the stored plan, read by
+        // evaluatePlacements for the plan-stability bias (M3). Same lifecycle.
+        this.priorAssignment = null;
+        // Per-city set of Ageless/unique building types, read by
+        // evaluatePlacements for the permanence premium (M4). Same lifecycle.
+        this.premiumTypes = null;
         engine.whenReady.then(() => { this.onReady(); });
     }
     onReady() {
@@ -186,7 +293,12 @@ class AutoPinPlannerSingleton {
         // Regenerate from a clean slate so plans reflect the current map.
         this.clearPins(KEY_PIN_LIST);
         this.runWonderCount = 0; // wonder-ambition damper resets per run
-        const placed = [];
+        // Prior full plans (per city, tagged cx,cy) drive the stability bias so
+        // re-planning keeps quarters put. Built buildings have already dropped
+        // out of the candidate pool, so the window advances on its own.
+        const priorFull = this.loadPinList(KEY_PLAN_FULL);
+        const pinned = [];
+        const full = [];
         const usedWonders = new Set(); // wonders are one-per-world
         // Every plan center at once, so each city can be planned only on the
         // tiles it "owns" (is nearest to). Without this, cities within ~6 tiles
@@ -194,10 +306,14 @@ class AutoPinPlannerSingleton {
         const centers = this.getPlanCenters();
         for (const center of centers) {
             const others = centers.filter(o => !(o.x == center.x && o.y == center.y));
-            placed.push(...this.planCity(center, usedWonders, others));
+            const prior = priorFull.filter(p => p.cx == center.x && p.cy == center.y);
+            const res = this.planCity(center, usedWonders, others, prior);
+            pinned.push(...res.pinned);
+            full.push(...res.full);
         }
-        this.savePinList(KEY_PIN_LIST, placed);
-        console.error(`[AutoPin] placed ${placed.length} building pins.`);
+        this.savePinList(KEY_PIN_LIST, pinned);
+        this.savePinList(KEY_PLAN_FULL, full);
+        console.error(`[AutoPin] placed ${pinned.length} pins from a ${full.length}-step plan.`);
     }
     /**
      * Re-plan a single city: clear only ITS old AutoPin pins (within the city
@@ -208,6 +324,7 @@ class AutoPinPlannerSingleton {
         const centers = this.getPlanCenters();
         const others = centers.filter(o => !(o.x == center.x && o.y == center.y));
         const old = this.loadPinList(KEY_PIN_LIST);
+        const oldFull = this.loadPinList(KEY_PLAN_FULL);
         // "Mine" = pins on tiles this city owns (is nearest to). Using nearest-
         // center ownership rather than a raw radius means re-planning one city
         // never clears a neighbor's pins that merely fall inside our radius.
@@ -224,9 +341,14 @@ class AutoPinPlannerSingleton {
             MapTackUtils.getConstructibleClassType(pin.type) == ConstructibleClassType.WONDER);
         this.runWonderCount = keptWonders.length;
         const usedWonders = new Set(keptWonders.map(pin => pin.type));
-        const placed = this.planCity(center, usedWonders, others);
-        this.savePinList(KEY_PIN_LIST, [...kept, ...placed]);
-        console.error(`[AutoPin] re-planned selected city: ${placed.length} pins.`);
+        // Prior full plan for THIS city (by its cx,cy tag) feeds the stability
+        // bias; other cities' stored plans are preserved untouched.
+        const prior = oldFull.filter(p => p.cx == center.x && p.cy == center.y);
+        const keptFull = oldFull.filter(p => !(p.cx == center.x && p.cy == center.y));
+        const res = this.planCity(center, usedWonders, others, prior);
+        this.savePinList(KEY_PIN_LIST, [...kept, ...res.pinned]);
+        this.savePinList(KEY_PLAN_FULL, [...keptFull, ...res.full]);
+        console.error(`[AutoPin] re-planned selected city: ${res.pinned.length} pins from ${res.full.length} planned.`);
     }
     /**
      * Center of the currently selected city, or null if none is selected (or
@@ -295,6 +417,12 @@ class AutoPinPlannerSingleton {
     suggestSettlements() {
         this.runBanner("settle");
         try {
+            // Settlement scoring reuses the placement scorer but isn't a city
+            // plan — make sure no stale per-city bias (gateway bonus, stability
+            // bias, permanence premium) from a prior planCity run bleeds into it.
+            this.gatewayCount = null;
+            this.priorAssignment = null;
+            this.premiumTypes = null;
             this.clearPins(KEY_SETTLE_LIST);
             const cityCenterType = this.getCityCenterType();
             if (!cityCenterType) {
@@ -354,6 +482,9 @@ class AutoPinPlannerSingleton {
     clearAll() {
         this.clearPins(KEY_PIN_LIST);
         this.clearPins(KEY_SETTLE_LIST);
+        // Drop the stored lifetime plan too (metadata only — no physical tacks),
+        // so a fresh F3 starts clean with no stability bias toward the old plan.
+        this.savePinList(KEY_PLAN_FULL, []);
     }
     clearPins(listKey) {
         try {
@@ -413,43 +544,112 @@ class AutoPinPlannerSingleton {
      * getRealizedPlotDetails folds already-placed map tacks into plot details,
      * every subsequent round automatically sees planned quarters/adjacencies.
      */
-    planCity(center, usedWonders = new Set(), otherCenters = []) {
-        const placed = [];
+    planCity(center, usedWonders = new Set(), otherCenters = [], priorPlan = null) {
+        // pinned = records we physically drop tacks for (window + anchors);
+        // full = the whole ordered plan (incl. the unpinned tail), stored for
+        // resync and the build-order log.
+        const pinned = [];
+        const full = [];
         const plots = this.getCandidatePlots(center, otherCenters);
         if (plots.length == 0) {
-            return placed;
+            return { pinned, full };
         }
+        // Plan-stability bias: reuse the same tile for the same building unless
+        // a new layout beats it by more than STABILITY_BONUS (M3).
+        this.priorAssignment = this.buildPriorAssignment(priorPlan);
         // Phase 1: buildings, planned in waves with an expanding tech horizon.
         // Wave 1 (buildable now) claims the core; later waves widen the pool
         // and — thanks to contiguity — fan outward from what's committed.
         // Unplaced candidates carry forward into later waves.
         let remaining = this.getCandidateBuildings(plots, center);
+        // Yield-class "lines": order base -> upgrade within a yield (Library
+        // before Academy) so the planner never pins an upgrade whose base it
+        // skipped. `predecessorsOf` is the hard gate (no orphan upgrades);
+        // `gatewayCount` biases a base to actually get placed so its upgrade
+        // can unlock. Both are computed once from the full candidate set.
+        const predecessorsOf = this.buildLinePredecessors(remaining);
+        this.gatewayCount = this.buildGatewayCount(predecessorsOf);
+        // Permanence premium set (M4): Ageless + active-unique buildings, which
+        // get the best tiles because their placement is forever.
+        this.premiumTypes = this.buildPremiumTypes(remaining);
         // Diagnostic: dist 0 = buildable now (core wave), >=1 = tech horizon.
-        // If an upgrade you can't build yet shows =0 here, it will wrongly
-        // compete with its available base — that's the bug this guards against.
         console.error(`[AutoPin] ${center.x},${center.y} building dists: `
             + remaining.map(c => `${c.type}=${c.dist}`).join(", "));
-        for (const wave of PLAN_WAVES) {
-            const pool = remaining.filter(c => c.dist <= wave.maxTechDistance).map(c => c.type);
-            if (pool.length == 0) {
-                continue;
+        const lineLog = [...predecessorsOf.entries()]
+            .filter(([, preds]) => preds.length)
+            .map(([t, preds]) => `${t}<-[${preds.join(",")}]`).join("; ");
+        console.error(`[AutoPin] ${center.x},${center.y} building lines: ${lineLog || "none"}`);
+        // Per-type ETA (build-slots to unlock) — also used to tag stored records.
+        const etaSlots = new Map();
+        for (const c of remaining) {
+            etaSlots.set(c.type, TECH_DIST_SLOTS[c.dist] ?? TECH_DIST_SLOTS[TECH_DIST_SLOTS.length - 1]);
+        }
+        // Phase 1: build the ordered building layout.
+        let layout;
+        if (USE_LIFETIME_SEQUENCE) {
+            // M2/M3: one discounted sequence over the whole current-age pool,
+            // grown until the marginal building stops being worth it (or the
+            // hard cap). The beam applies gamma^slotTime so the layout is
+            // globally optimized but ordered by when each piece can be built.
+            const discountCfg = { etaSlots, gamma: LIFETIME_GAMMA, unownedPenalty: UNOWNED_SLOT_PENALTY };
+            const pool = remaining.map(c => c.type);
+            layout = this.beamSearch(
+                pool, plots, Math.min(pool.length, LIFETIME_MAX_PINS),
+                predecessorsOf, new Set(), discountCfg, LIFETIME_MARGINAL_FLOOR);
+            // M4 polish: local-search relocation swaps over the finished layout.
+            layout = this.relocationPass(layout);
+        } else {
+            // Legacy wave planner (M1). Types placed in earlier waves count as
+            // satisfied predecessors for later waves (a Library placed in wave 1
+            // unlocks Academy in wave 2).
+            layout = [];
+            const cityPlaced = new Set();
+            for (const wave of PLAN_WAVES) {
+                const pool = remaining.filter(c => c.dist <= wave.maxTechDistance).map(c => c.type);
+                if (pool.length == 0) {
+                    continue;
+                }
+                const wavePlots = wave.ownedOnly ? plots.filter(p => p.owned) : plots;
+                if (wavePlots.length == 0) {
+                    continue;
+                }
+                const waveLayout = this.beamSearch(
+                    pool, wavePlots, Math.min(pool.length, wave.budget), predecessorsOf, cityPlaced);
+                const placedTypes = new Set();
+                for (const pin of waveLayout) {
+                    layout.push(pin);
+                    placedTypes.add(pin.type);
+                    cityPlaced.add(pin.type);
+                }
+                remaining = remaining.filter(c => !placedTypes.has(c.type));
             }
-            const wavePlots = wave.ownedOnly ? plots.filter(p => p.owned) : plots;
-            if (wavePlots.length == 0) {
-                continue;
-            }
-            const layout = this.beamSearch(pool, wavePlots, Math.min(pool.length, wave.budget));
-            const placedTypes = new Set();
-            for (const pin of layout) {
+        }
+        // Windowed pinning (M3): physically pin only the first WINDOW_SIZE of
+        // the (all-unbuilt) sequence, plus Ageless anchors anywhere in it. The
+        // whole sequence is recorded in `full` for storage and the log.
+        // Windowing is a lifetime-plan feature: with the toggle off, the legacy
+        // wave planner pins every one of its (already small) set, as before.
+        const windowLimit = USE_LIFETIME_SEQUENCE ? WINDOW_SIZE : Infinity;
+        let order = 0;
+        for (const pin of layout) {
+            const anchor = PIN_AGELESS_ANCHORS && this.isAgelessType(pin.type);
+            const doPin = order < windowLimit || anchor;
+            const rec = {
+                x: pin.x, y: pin.y, type: pin.type,
+                order, eta: etaSlots.get(pin.type) ?? 0,
+                anchor, pinned: doPin, cx: center.x, cy: center.y
+            };
+            if (doPin) {
                 this.placePin(pin);
-                placed.push({ x: pin.x, y: pin.y, type: pin.type });
-                placedTypes.add(pin.type);
+                pinned.push(rec);
             }
-            remaining = remaining.filter(c => !placedTypes.has(c.type));
+            full.push(rec);
+            order++;
         }
         // Phase 2: wonders. Placed after buildings so mutual adjacency pulls
         // them next to planned quarters (every building gains adjacency from
-        // wonders), and their own terrain adjacencies still count.
+        // wonders), and their own terrain adjacencies still count. Wonders are
+        // few and permanent, so they're always pinned (natural anchors).
         const wonderPool = this.getCandidateWonders(plots, usedWonders, center);
         let wondersRemaining = Math.min(wonderPool.length, MAX_WONDERS_PER_CITY);
         while (wondersRemaining > 0 && wonderPool.length > 0) {
@@ -458,12 +658,21 @@ class AutoPinPlannerSingleton {
                 break; // nothing left that justifies a wonder race
             }
             this.placePin(best);
-            placed.push({ x: best.x, y: best.y, type: best.type });
+            const rec = {
+                x: best.x, y: best.y, type: best.type,
+                order: order++, eta: 0, anchor: true, pinned: true, cx: center.x, cy: center.y
+            };
+            pinned.push(rec);
+            full.push(rec);
             usedWonders.add(best.type);
             wonderPool.splice(wonderPool.indexOf(best.type), 1);
             wondersRemaining--;
         }
-        return placed;
+        this.logBuildOrder(center, full);
+        // Don't leak this city's per-plan biases into the next city / settle scan.
+        this.priorAssignment = null;
+        this.premiumTypes = null;
+        return { pinned, full };
     }
     findBestPlacement(pool, plots, useMutual = true) {
         return this.evaluatePlacements(pool, plots, useMutual, 1)[0] ?? null;
@@ -472,7 +681,7 @@ class AutoPinPlannerSingleton {
      * Score every legal (type, plot) pair against the current (possibly
      * hypothetical) map state and return the top `topM`, best first.
      */
-    evaluatePlacements(pool, plots, useMutual = true, topM = 1) {
+    evaluatePlacements(pool, plots, useMutual = true, topM = 1, scoreAdjust = null) {
         const results = [];
         // Baseline scores of existing tacks, memoized for this pass.
         const baselineScores = new Map();
@@ -519,11 +728,41 @@ class AutoPinPlannerSingleton {
                         urbanizeCosts.set(plotKey, urbanizeCost);
                     }
                     score -= urbanizeCost;
+                    // M4 permanence premium: scale a permanent (Ageless/unique)
+                    // building's value up so it wins the best tiles; otherwise
+                    // add the small overbuild-fodder bias so a throwaway building
+                    // still gravitates to adjacency-rich tiles a future age can
+                    // inherit. Applied to the placement VALUE, before the
+                    // behavioral nudges below.
+                    if (this.premiumTypes?.has(type)) {
+                        score *= PERMANENCE_PREMIUM;
+                    } else if (FODDER_ADJACENCY_FRACTION > 0) {
+                        score += FODDER_ADJACENCY_FRACTION * this.adjacencyMagnitude(yieldDetails);
+                    }
+                    // Gateway bonus: bias a base building that still has unplaced
+                    // higher-tier siblings so it gets placed and unlocks its
+                    // upgrade (pairs with the line-order gate in beamSearch).
+                    const gatewayN = this.gatewayCount?.get(type);
+                    if (gatewayN) {
+                        score += GATEWAY_BONUS * gatewayN;
+                    }
+                    // Plan-stability bias (M3): reward keeping a building on the
+                    // tile it held in the stored plan, so re-planning doesn't
+                    // shuffle quarters around for a negligible gain.
+                    const prior = this.priorAssignment?.get(type);
+                    if (prior && prior.x == plot.x && prior.y == plot.y) {
+                        score += STABILITY_BONUS;
+                    }
                     // Wonder-ambition damper: each wonder already planned this
                     // run raises the bar for the next one.
                     if (this.runWonderCount > 0
                         && MapTackUtils.getConstructibleClassType(type) == ConstructibleClassType.WONDER) {
                         score *= Math.pow(WONDER_DAMPING, this.runWonderCount);
+                    }
+                    // Lifetime time-discount (M2), applied last so it wraps the
+                    // full raw score and BEFORE the top-M truncation below.
+                    if (scoreAdjust) {
+                        score = scoreAdjust(type, score, plot);
                     }
                     results.push({ x: plot.x, y: plot.y, type, validStatus, yieldDetails, score });
                 }
@@ -541,17 +780,44 @@ class AutoPinPlannerSingleton {
      * permutations of the same pin set collapse into one state. Returns the
      * pin list of the best layout found.
      */
-    beamSearch(pool, plots, budget) {
+    beamSearch(pool, plots, budget, predecessorsOf = null, cityPlaced = null, discountCfg = null, marginalFloor = 0) {
         let beam = [{ pins: [], poolLeft: pool, total: 0 }];
         let bestComplete = beam[0];
+        let prevBestTotal = 0; // best total after the previous round, for the floor
         for (let round = 0; round < budget; round++) {
             const nextStates = new Map();
             for (const state of beam) {
+                // Line-order gate: only offer a building once every cheaper-to-
+                // unlock sibling in its yield-class line is already placed (in
+                // this layout or an earlier wave). This is what stops an upgrade
+                // (Academy) from being pinned without its base (Library).
+                const allowedPool = this.filterByLineOrder(
+                    state.poolLeft, state.pins, predecessorsOf, cityPlaced);
+                if (allowedPool.length == 0) {
+                    continue; // nothing legal to extend this layout with yet
+                }
+                // Lifetime discount (M2): a placement entering at sequence
+                // position `pos` is worth gamma^max(pos+acqDelay, techEta) of
+                // its raw score. Built per state so `pos` reflects this layout's
+                // length; applied inside evaluatePlacements BEFORE it truncates
+                // to the top extensions, so a now-buildable pin can rightly beat
+                // a fatter-but-distant one for an early slot. null => no discount
+                // (wave planner and non-plan callers score raw, exactly as before).
+                let scoreAdjust = null;
+                if (discountCfg) {
+                    const pos = state.pins.length;
+                    scoreAdjust = (type, raw, plot) => {
+                        const acq = (plot && plot.owned === false) ? discountCfg.unownedPenalty : 0;
+                        const eta = discountCfg.etaSlots.get(type) ?? 0;
+                        const slotTime = Math.max(pos + acq, eta);
+                        return raw * Math.pow(discountCfg.gamma, slotTime);
+                    };
+                }
                 // Apply this layout's pins so scoring sees them.
                 const handles = state.pins.map(p => this.hypotheticalInsert(p.x, p.y, p.type, p.validStatus));
                 let exts;
                 try {
-                    exts = this.evaluatePlacements(state.poolLeft, plots, true, BEAM_EXTENSIONS);
+                    exts = this.evaluatePlacements(allowedPool, plots, true, BEAM_EXTENSIONS, scoreAdjust);
                 } finally {
                     for (const h of handles.reverse()) {
                         this.hypotheticalRemove(h);
@@ -577,6 +843,17 @@ class AutoPinPlannerSingleton {
             beam = [...nextStates.values()].sort((a, b) => b.total - a.total).slice(0, BEAM_WIDTH);
             if (beam[0].total > bestComplete.total) {
                 bestComplete = beam[0];
+            }
+            // Marginal-value floor (M3): if the best layout this round grew by
+            // less than the floor, the next building isn't worth planning —
+            // stop and let the sequence length be data-driven. Guarded so the
+            // wave planner and undiscounted callers (floor 0) are unaffected.
+            if (marginalFloor > 0) {
+                const gain = beam[0].total - prevBestTotal;
+                prevBestTotal = beam[0].total;
+                if (gain < marginalFloor) {
+                    break;
+                }
             }
         }
         return bestComplete.pins;
@@ -671,6 +948,164 @@ class AutoPinPlannerSingleton {
         if (mapTackData.classType == ConstructibleClassType.WONDER) {
             this.runWonderCount++;
         }
+    }
+
+    /**
+     * type -> {x,y} from a stored plan (records tagged with cx,cy for this
+     * city), for the plan-stability bias. Null/empty prior -> null (no bias),
+     * so a first-time plan behaves exactly as before.
+     */
+    buildPriorAssignment(priorPlan) {
+        if (!priorPlan || priorPlan.length == 0) {
+            return null;
+        }
+        const map = new Map();
+        for (const r of priorPlan) {
+            if (r && r.type) {
+                map.set(r.type, { x: r.x, y: r.y });
+            }
+        }
+        return map.size ? map : null;
+    }
+
+    /**
+     * Is this building Ageless (permanent, never overbuilt)? Ageless placements
+     * are pinned as anchors even when deep in the sequence. Falls back to false
+     * if DMT's helper isn't available.
+     */
+    isAgelessType(type) {
+        try {
+            return typeof MapTackUtils.isAgeless == "function" && MapTackUtils.isAgeless(type);
+        } catch (e) {
+            return false;
+        }
+    }
+
+    /**
+     * Types that get the permanence premium (M4): Ageless candidates plus the
+     * civ's active unique buildings — placements you make once and keep. Built
+     * once per city plan.
+     */
+    buildPremiumTypes(candidates) {
+        const set = new Set();
+        for (const c of candidates) {
+            if (this.isAgelessType(c.type)) {
+                set.add(c.type);
+            }
+        }
+        try {
+            for (const e of GameInfo.Buildings) {
+                if (e.TraitType && e.TraitType != "TRAIT_LEADER_MINOR_CIV"
+                    && TraitModifier.isTraitActive(e.TraitType)) {
+                    set.add(e.ConstructibleType);
+                }
+            }
+        } catch (e) { /* no trait data -> Ageless-only premium */ }
+        return set;
+    }
+
+    /**
+     * Weighted magnitude of a placement's adjacency yields — a proxy for how
+     * adjacency-rich its tile is, used for the overbuild-fodder bias (M4).
+     */
+    adjacencyMagnitude(yieldDetails) {
+        let m = 0;
+        for (const y of (yieldDetails?.adjacencies || [])) {
+            m += Math.abs((y.amount || 0) * (YIELD_WEIGHTS[y.type] ?? 1));
+        }
+        return m;
+    }
+
+    /**
+     * Local-search polish (M4): given the finished building layout, try swapping
+     * the tiles of building pairs and keep any swap that raises total placement
+     * value, re-validating both new (tile, building) pairs. Building SEQUENCE
+     * (build order) is untouched — only which tile each building sits on can
+     * change — so the discounted ordering the beam chose is preserved. Scores
+     * the raw per-tile proxy (no mutual-adjacency/discount), so it only takes
+     * strict improvements; a swap also refreshes the pin's cached validStatus/
+     * yieldDetails so the placed tack renders correctly.
+     */
+    relocationPass(layout) {
+        if (!ENABLE_RELOCATION_PASS || !layout || layout.length < 2) {
+            return layout;
+        }
+        const pins = layout.map(p => ({ ...p }));
+        const scoreCache = new Map();
+        const scoreAt = (type, x, y) => {
+            const key = `${type}@${x},${y}`;
+            if (scoreCache.has(key)) {
+                return scoreCache.get(key);
+            }
+            let s;
+            try {
+                s = this.scoreYields(MapTackYield.getYieldDetails(x, y, type));
+                if (this.premiumTypes?.has(type)) {
+                    s *= PERMANENCE_PREMIUM;
+                }
+            } catch (e) {
+                s = -Infinity;
+            }
+            scoreCache.set(key, s);
+            return s;
+        };
+        const validAt = (type, x, y) => {
+            try {
+                const v = MapTackValidator.isValid(x, y, type);
+                return v.isValid && !v.preventPlacement;
+            } catch (e) {
+                return false;
+            }
+        };
+        let improved = 0;
+        MapTackUtils.togglePlotDetailsCache(true);
+        try {
+            for (let i = 0; i < pins.length; i++) {
+                for (let j = i + 1; j < pins.length; j++) {
+                    const a = pins[i], b = pins[j];
+                    if (a.x == b.x && a.y == b.y) {
+                        continue; // same tile (a quarter) — nothing to swap
+                    }
+                    const cur = scoreAt(a.type, a.x, a.y) + scoreAt(b.type, b.x, b.y);
+                    const swapped = scoreAt(a.type, b.x, b.y) + scoreAt(b.type, a.x, a.y);
+                    if (swapped > cur + 1e-6
+                        && validAt(a.type, b.x, b.y) && validAt(b.type, a.x, a.y)) {
+                        const ax = a.x, ay = a.y;
+                        a.x = b.x; a.y = b.y; b.x = ax; b.y = ay;
+                        // Refresh cached render data for the new tiles.
+                        try {
+                            a.validStatus = MapTackValidator.isValid(a.x, a.y, a.type);
+                            a.yieldDetails = MapTackYield.getYieldDetails(a.x, a.y, a.type);
+                            b.validStatus = MapTackValidator.isValid(b.x, b.y, b.type);
+                            b.yieldDetails = MapTackYield.getYieldDetails(b.x, b.y, b.type);
+                        } catch (e) { /* leave stale render data if the API errors */ }
+                        improved++;
+                    }
+                }
+            }
+        } finally {
+            MapTackUtils.togglePlotDetailsCache(false);
+        }
+        if (improved) {
+            console.error(`[AutoPin] relocation pass: applied ${improved} swap(s).`);
+        }
+        return pins;
+    }
+
+    /**
+     * Print the lifetime sequence as a readable, ordered build order — the
+     * cheapest "whole-plan view" (design §5.3). Each entry shows when it comes
+     * online (`now` / `+N` slots) and whether it's physically pinned this pass
+     * (`pin`) or held in the stored tail (`plan`); anchors are marked `*`.
+     */
+    logBuildOrder(center, full) {
+        const line = full.map((r, i) => {
+            const when = r.eta > 0 ? `+${r.eta}` : "now";
+            const tag = r.pinned ? (r.anchor ? "pin*" : "pin") : "plan";
+            return `${i + 1}. ${r.type} @ (${r.x},${r.y}) [${when},${tag}]`;
+        }).join(" · ");
+        const pinnedCount = full.filter(r => r.pinned).length;
+        console.error(`[AutoPin] ${center.x},${center.y} build order (${full.length}, ${pinnedCount} pinned): ${line || "empty"}`);
     }
 
     /**
@@ -1205,6 +1640,173 @@ class AutoPinPlannerSingleton {
                 + warehouseRejects.join(", "));
         }
         return candidates;
+    }
+
+    /* --------------------------------------------------- building lines (M1) */
+
+    /**
+     * Group candidate buildings into yield-class "lines" and return, for each
+     * building, the list of same-line siblings that should be built BEFORE it
+     * (its lower-ranked predecessors). Rank within a line is by unlock order
+     * (tech distance), then by adjacency strength (weaker = base = earlier),
+     * then by type name for determinism. A building with no predecessors maps
+     * to an empty array. Only candidate types are considered, so a base that's
+     * already built (and thus excluded from candidates) is never a predecessor
+     * and never blocks its upgrade.
+     *
+     * Fails soft: if yield-class data can't be read, buildings are unclassified,
+     * no lines form, and planning behaves exactly as before.
+     */
+    buildLinePredecessors(candidates) {
+        const map = new Map();
+        for (const c of candidates) {
+            map.set(c.type, []);
+        }
+        try {
+            const byClass = new Map();
+            const info = new Map(); // type -> { dist, strength }
+            for (const c of candidates) {
+                const cls = this.getBuildingYieldClass(c.type);
+                if (!cls) {
+                    continue; // unclassified -> its own singleton, no ordering
+                }
+                info.set(c.type, { dist: c.dist, strength: this.getAdjacencyStrength(c.type) });
+                if (!byClass.has(cls)) {
+                    byClass.set(cls, []);
+                }
+                byClass.get(cls).push(c.type);
+            }
+            for (const [, types] of byClass) {
+                if (types.length < 2) {
+                    continue; // a lone building in its class needs no ordering
+                }
+                types.sort((a, b) => {
+                    const ia = info.get(a), ib = info.get(b);
+                    if (ia.dist != ib.dist) {
+                        return ia.dist - ib.dist;       // unlocks earlier -> base
+                    }
+                    if (ia.strength != ib.strength) {
+                        return ia.strength - ib.strength; // weaker -> base
+                    }
+                    return a < b ? -1 : 1;              // deterministic tiebreak
+                });
+                // Every earlier-ranked sibling is a predecessor (build the
+                // whole line as a contiguous prefix, weakest first).
+                for (let i = 0; i < types.length; i++) {
+                    map.set(types[i], types.slice(0, i));
+                }
+            }
+        } catch (e) {
+            console.error(`[AutoPin] line build failed (planning falls back to unordered): ${e}`);
+        }
+        return map;
+    }
+
+    /**
+     * Inverse of buildLinePredecessors: how many gated successors each base
+     * building has. Drives the gateway bonus in evaluatePlacements.
+     */
+    buildGatewayCount(predecessorsOf) {
+        const count = new Map();
+        for (const preds of predecessorsOf.values()) {
+            for (const p of preds) {
+                count.set(p, (count.get(p) || 0) + 1);
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Drop from `pool` any building whose line-predecessors aren't all placed
+     * yet — in this layout (`pins`) or in an earlier wave (`cityPlaced`). With
+     * no line data this returns the pool unchanged.
+     */
+    filterByLineOrder(pool, pins, predecessorsOf, cityPlaced) {
+        if (!predecessorsOf) {
+            return pool;
+        }
+        const placed = new Set(pins.map(p => p.type));
+        if (cityPlaced) {
+            for (const t of cityPlaced) {
+                placed.add(t);
+            }
+        }
+        return pool.filter(type => {
+            const preds = predecessorsOf.get(type);
+            if (!preds || preds.length == 0) {
+                return true;
+            }
+            return preds.every(p => placed.has(p));
+        });
+    }
+
+    /**
+     * Dominant yield type of a building, used to bucket it into a line. Reads
+     * the building's adjacency yields first (this is what actually separates a
+     * Library from a Granary), then base yields as a fallback. Returns null if
+     * nothing is readable — the caller treats null as "unclassified".
+     *
+     * Column names for these GameInfo tables are assumptions (Constructible_
+     * Adjacencies.YieldType / .YieldChange, Constructible_YieldChanges.*); if
+     * they're wrong, classification yields null everywhere and lines simply
+     * don't form. The per-city "building lines:" console log makes that visible.
+     */
+    getBuildingYieldClass(type) {
+        if (!this._yieldClassCache) {
+            this._yieldClassCache = new Map();
+        }
+        if (this._yieldClassCache.has(type)) {
+            return this._yieldClassCache.get(type);
+        }
+        const totals = new Map();
+        const add = (yt, amt) => {
+            if (!yt) {
+                return;
+            }
+            totals.set(yt, (totals.get(yt) || 0) + (Number(amt) || 0));
+        };
+        try {
+            for (const a of (GameInfo.Constructible_Adjacencies || [])) {
+                if (a.ConstructibleType == type) {
+                    add(a.YieldType, a.YieldChange ?? 1);
+                }
+            }
+        } catch (e) { /* table/column absent -> fall through */ }
+        if (totals.size == 0) {
+            try {
+                for (const y of (GameInfo.Constructible_YieldChanges || [])) {
+                    if (y.ConstructibleType == type) {
+                        add(y.YieldType, y.YieldChange);
+                    }
+                }
+            } catch (e) { /* no base-yield table -> unclassified */ }
+        }
+        let best = null, bestAmt = -Infinity;
+        for (const [yt, amt] of totals) {
+            if (amt > bestAmt) {
+                bestAmt = amt;
+                best = yt;
+            }
+        }
+        this._yieldClassCache.set(type, best);
+        return best;
+    }
+
+    /**
+     * Total magnitude of a building's adjacency yields — a proxy for "how
+     * strong" it is, used only to order same-unlock-distance siblings so the
+     * weaker one ranks as the base.
+     */
+    getAdjacencyStrength(type) {
+        let s = 0;
+        try {
+            for (const a of (GameInfo.Constructible_Adjacencies || [])) {
+                if (a.ConstructibleType == type) {
+                    s += Math.abs(Number(a.YieldChange ?? 1));
+                }
+            }
+        } catch (e) { /* no adjacency data -> strength 0 */ }
+        return s;
     }
 
     /**

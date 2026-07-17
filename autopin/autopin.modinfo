@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Mod id="autopin" version="12" xmlns="ModInfo">
+<Mod id="autopin" version="13" xmlns="ModInfo">
     <Properties>
         <Name>LOC_MOD_AUTOPIN_NAME</Name>
         <Description>LOC_MOD_AUTOPIN_DESCRIPTION</Description>

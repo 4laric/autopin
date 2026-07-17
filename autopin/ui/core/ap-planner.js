@@ -24,6 +24,10 @@ import TreeModifier from '/detailed-map-tacks/ui/map-tack-core/modifier/dmt-tree
 import MapTackModifier from '/detailed-map-tacks/ui/map-tack-core/dmt-map-tack-modifier.js';
 import { Catalog } from '/detailed-map-tacks/ui/map-tack-core/dmt-utility-serialize.js';
 import { ComponentID } from '/core/ui/utilities/utilities-component-id.js';
+// Settle-time appeal signal: Breathtaking/Charming thresholds live in
+// GameInfo.GlobalParameters -- same source the base game's own Appeal lens
+// reads (base-standard ui/lenses/layer/general-appeal-layer.js).
+import { getGlobalParamNumber } from '/core/ui/utilities/utilities-data.js';
 
 const CITY_RADIUS = 3;
 const MAX_BUILDINGS_PER_CITY = 8;
@@ -72,6 +76,15 @@ const UNOWNED_SLOT_PENALTY = 2;
 // GameInfo tables not yet verified from inside the game, so the sequence runs
 // on buckets by default and sharpens later without changing the algorithm.
 const TECH_DIST_SLOTS = [0, 3, 8];
+// Tech-aware contiguity: a bridge tile the lifetime beam hasn't actually
+// built yet (a planned-but-tech-gated pin) may only count as "urban" for a
+// candidate building if that pin's own tech distance is <= the candidate's.
+// Without this, the beam happily routes a buildable-now building's tile
+// through a bridge that needs research the player doesn't have — the bug
+// this exists to close. Real, already-built urban tiles always count
+// (see isUrbanReachable). Only affects the USE_LIFETIME_SEQUENCE beam;
+// false reproduces the exact previous (tech-blind) contiguity check.
+const TECH_AWARE_CONTIGUITY = true;
 
 // ---- Windowed lifetime plan (M3) ----------------------------------------
 // The lifetime sequence is computed in full and STORED, but only a near-term
@@ -131,6 +144,15 @@ const WONDER_MIN_SCORE = 6;
 // the game's Warehouse_YieldChanges data — DMT doesn't model these) clear
 // this floor.
 const WAREHOUSE_MIN_SCORE = 3;
+// Bridge exception to the floor above: when this city has a genuine
+// contiguity gap (some candidate tile isn't reachable through the urban
+// network yet), a placement-agnostic warehouse building that's buildable
+// RIGHT NOW (tech distance 0) is let into the pool even if it misses
+// WAREHOUSE_MIN_SCORE — it's the cheapest legal way to urbanize a stepping-
+// stone tile, which a tech-gated (unresearched) building can no longer do
+// once contiguity is tech-aware (see TECH_AWARE_CONTIGUITY). Set false to
+// go back to the plain floor with no exception.
+const WAREHOUSE_BRIDGE_ENABLE = true;
 
 // Line-order gateway bonus. A "base" building that still has unplaced higher-
 // tier siblings in its yield-class line (e.g. Library while Academy is
@@ -155,6 +177,42 @@ const SETTLE_SEARCH_RADIUS = 7;  // how far from existing centers to search
 const SETTLE_FINALISTS = 8;      // candidates that get full plan-value scoring
 const SETTLE_SUGGESTIONS = 3;    // city-center tacks to place
 const SETTLE_PLAN_ROUNDS = 4;    // buildings in the hypothetical plan
+
+// Independent-power spacing. The game's min-settlement-distance rule counts
+// independent villages/encampments the same as real cities, but their
+// location is sometimes NOT yet revealed to the player, and settling next to
+// one can be a deliberate, valid play (clear it, then found) rather than a
+// mistake. Kept as its OWN knob (default equal to MIN_SETTLE_DISTANCE) so it
+// can be relaxed independently of real-city spacing without touching that
+// constant. Lower it to let candidates land closer to unseen independents;
+// DMT's validator still blocks a plot actually sitting ON a village tile.
+const IP_SETTLE_SPACING = MIN_SETTLE_DISTANCE;
+
+// Expansion-room scoring (cheapSettleScore): how far out to look for open,
+// claimable land when rewarding "room to grow". Wider than the CITY_RADIUS
+// working ring on purpose -- this rewards FRONTIER, not just the first-ring
+// tiles cheapSettleScore already scores directly.
+const EXPANSION_SEARCH_RADIUS = 4;
+// Weight per open (unowned-or-ours, non-water, non-mountain) tile found
+// within EXPANSION_SEARCH_RADIUS -- plain room to grow into later.
+const EXPANSION_OPEN_TILE_WEIGHT = 0.5;
+// Extra weight per resource tile found on that open land -- future
+// improvements worth claiming, on top of plain room.
+const EXPANSION_RESOURCE_WEIGHT = 1;
+
+// Natural Wonder / appeal scoring (cheapSettleScore). Natural Wonders are a
+// big one-time win (huge yields/adjacency, can't be missed later), so they
+// get a large flat weight; Breathtaking/Charming appeal tiles get a smaller
+// per-tile nudge.
+const WONDER_APPEAL_SEARCH_RADIUS = 3;
+const NATURAL_WONDER_WEIGHT = 12;      // per Natural Wonder tile in radius
+const BREATHTAKING_APPEAL_WEIGHT = 4;  // per Breathtaking-appeal tile in radius
+const CHARMING_APPEAL_WEIGHT = 1.5;    // per Charming-appeal tile in radius
+// Fallback appeal thresholds if GameInfo.GlobalParameters lookup fails --
+// approximate vanilla values so the signal degrades gracefully instead of
+// going to zero.
+const FALLBACK_BREATHTAKING_APPEAL = 3;
+const FALLBACK_CHARMING_APPEAL = 1;
 
 // Yield weights used for scoring. Tweak to taste.
 //
@@ -593,6 +651,28 @@ class AutoPinPlannerSingleton {
         for (const c of remaining) {
             etaSlots.set(c.type, TECH_DIST_SLOTS[c.dist] ?? TECH_DIST_SLOTS[TECH_DIST_SLOTS.length - 1]);
         }
+        // Tech-aware contiguity inputs (see isUrbanReachable/beamSearch):
+        // - distByType: each candidate's own tech distance, so the beam can
+        //   look a PLANNED pin's distance up by type without recomputing
+        //   techDistance() (which reads tree node state) every round.
+        // - realDistrictByKey: a snapshot of REAL district state taken NOW,
+        //   before any hypothetical planning work starts this call — anything
+        //   already built is buildable now by definition, so it always counts
+        //   as a bridge regardless of what we're about to plan. Must be taken
+        //   before beamSearch starts hypothetically inserting pins, since DMT
+        //   can't tell "really built" from "hypothetically inserted for
+        //   scoring" apart once that starts.
+        const distByType = new Map();
+        for (const c of remaining) {
+            distByType.set(c.type, c.dist);
+        }
+        const realDistrictByKey = new Map();
+        for (const p of plots) {
+            const details = MapTackUtils.getRealizedPlotDetails(p.x, p.y);
+            if (details?.district) {
+                realDistrictByKey.set(`${p.x},${p.y}`, details.district);
+            }
+        }
         // Phase 1: build the ordered building layout.
         let layout;
         if (USE_LIFETIME_SEQUENCE) {
@@ -600,7 +680,15 @@ class AutoPinPlannerSingleton {
             // grown until the marginal building stops being worth it (or the
             // hard cap). The beam applies gamma^slotTime so the layout is
             // globally optimized but ordered by when each piece can be built.
-            const discountCfg = { etaSlots, gamma: LIFETIME_GAMMA, unownedPenalty: UNOWNED_SLOT_PENALTY };
+            const discountCfg = {
+                etaSlots, gamma: LIFETIME_GAMMA, unownedPenalty: UNOWNED_SLOT_PENALTY,
+                // Gated by TECH_AWARE_CONTIGUITY so the fix can be switched
+                // off without touching beamSearch/evaluatePlacements: when
+                // false, beamSearch sees no realDistrictByKey and falls back
+                // to the exact previous (tech-blind) reachability check.
+                distByType: TECH_AWARE_CONTIGUITY ? distByType : null,
+                realDistrictByKey: TECH_AWARE_CONTIGUITY ? realDistrictByKey : null,
+            };
             const pool = remaining.map(c => c.type);
             layout = this.beamSearch(
                 pool, plots, Math.min(pool.length, LIFETIME_MAX_PINS),
@@ -690,7 +778,7 @@ class AutoPinPlannerSingleton {
      * Score every legal (type, plot) pair against the current (possibly
      * hypothetical) map state and return the top `topM`, best first.
      */
-    evaluatePlacements(pool, plots, useMutual = true, topM = 1, scoreAdjust = null) {
+    evaluatePlacements(pool, plots, useMutual = true, topM = 1, scoreAdjust = null, reach = null) {
         const results = [];
         // Baseline scores of existing tacks, memoized for this pass.
         const baselineScores = new Map();
@@ -704,9 +792,33 @@ class AutoPinPlannerSingleton {
         MapTackUtils.togglePlotDetailsCache(true);
         try {
             // Urban contiguity: cities grow outward, so only tiles touching
-            // the (planned) urban network are placeable this round.
-            const reachablePlots = plots.filter(p => this.isUrbanReachable(p));
+            // the (planned) urban network are placeable this round. In
+            // tech-aware mode (`reach` supplied) reachability also depends on
+            // the candidate TYPE's own tech distance (see isUrbanReachable),
+            // so it's computed per distinct distance seen in `pool` rather
+            // than once for the whole pool — memoized, since there are only
+            // ever 3 distinct distances (0/1/2).
+            const reachableCache = new Map();
+            const reachablePlotsFor = (type) => {
+                if (!reach) {
+                    let cached = reachableCache.get("legacy");
+                    if (!cached) {
+                        cached = plots.filter(p => this.isUrbanReachable(p));
+                        reachableCache.set("legacy", cached);
+                    }
+                    return cached;
+                }
+                const dist = reach.distByType?.get(type) ?? 0;
+                let cached = reachableCache.get(dist);
+                if (!cached) {
+                    cached = plots.filter(p => this.isUrbanReachable(p, { ...reach, dist }));
+                    reachableCache.set(dist, cached);
+                }
+                return cached;
+            };
             for (const type of pool) {
+                const reachablePlots = reachablePlotsFor(type);
+                const typeDist = reach ? (reach.distByType?.get(type) ?? 0) : undefined;
                 for (const plot of reachablePlots) {
                     const validStatus = MapTackValidator.isValid(plot.x, plot.y, type);
                     if (!validStatus.isValid || validStatus.preventPlacement) {
@@ -773,7 +885,11 @@ class AutoPinPlannerSingleton {
                     if (scoreAdjust) {
                         score = scoreAdjust(type, score, plot);
                     }
-                    results.push({ x: plot.x, y: plot.y, type, validStatus, yieldDetails, score });
+                    // Tech distance tag (tech-aware contiguity, see beamSearch):
+                    // carried on the result so a pin built from it can report
+                    // its own tech distance to LATER rounds' reachability
+                    // checks without recomputing techDistance() every round.
+                    results.push({ x: plot.x, y: plot.y, type, validStatus, yieldDetails, score, dist: typeDist });
                 }
             }
         } finally {
@@ -822,11 +938,32 @@ class AutoPinPlannerSingleton {
                         return raw * Math.pow(discountCfg.gamma, slotTime);
                     };
                 }
+                // Tech-aware contiguity (see isUrbanReachable): only built when
+                // discountCfg carries the tech-distance/real-district snapshot
+                // (i.e. TECH_AWARE_CONTIGUITY is on and we're in the lifetime
+                // beam); null for the legacy wave planner, which then falls
+                // straight back to the old tech-blind reachability check.
+                // `pinDistByKey` is THIS layout's own planned pins (state.pins),
+                // keyed by tile, each tagged with its own tech distance — a
+                // later candidate can only bridge through one whose distance is
+                // <= its own.
+                let reach = null;
+                if (discountCfg?.realDistrictByKey) {
+                    const pinDistByKey = new Map();
+                    for (const p of state.pins) {
+                        pinDistByKey.set(`${p.x},${p.y}`, p.dist ?? discountCfg.distByType?.get(p.type) ?? 0);
+                    }
+                    reach = {
+                        distByType: discountCfg.distByType,
+                        realDistrictByKey: discountCfg.realDistrictByKey,
+                        pinDistByKey
+                    };
+                }
                 // Apply this layout's pins so scoring sees them.
                 const handles = state.pins.map(p => this.hypotheticalInsert(p.x, p.y, p.type, p.validStatus));
                 let exts;
                 try {
-                    exts = this.evaluatePlacements(allowedPool, plots, true, BEAM_EXTENSIONS, scoreAdjust);
+                    exts = this.evaluatePlacements(allowedPool, plots, true, BEAM_EXTENSIONS, scoreAdjust, reach);
                 } finally {
                     for (const h of handles.reverse()) {
                         this.hypotheticalRemove(h);
@@ -874,7 +1011,38 @@ class AutoPinPlannerSingleton {
      * center exactly like real cities, and each committed pin unlocks its
      * neighbors for the next round.
      */
-    isUrbanReachable(plot) {
+    isUrbanReachable(plot, reach = null) {
+        const key = `${plot.x},${plot.y}`;
+        if (reach) {
+            // Tech-aware mode (lifetime beam only). A candidate of tech
+            // distance reach.dist may treat a tile as urban via a PLANNED pin
+            // only if that pin's own tech distance is <= reach.dist — i.e. the
+            // bridge unlocks no later than the building leaning on it. Real,
+            // already-built district state (snapshotted before this planCity
+            // call started any hypothetical work) always counts, since it's
+            // buildable now by definition. We can't ask DMT live for "real-
+            // only" state here, because this beam state's own pins are
+            // hypothetically inserted into DMT's cache for scoring.
+            const ownReal = reach.realDistrictByKey.get(key);
+            if (ownReal == "DISTRICT_URBAN" || ownReal == "DISTRICT_CITY_CENTER") {
+                return true;
+            }
+            const ownPinDist = reach.pinDistByKey.get(key);
+            if (ownPinDist !== undefined && ownPinDist <= reach.dist) {
+                return true;
+            }
+            return this.getHexNeighbors(plot.x, plot.y).some(loc => {
+                const nKey = `${loc.x},${loc.y}`;
+                const nReal = reach.realDistrictByKey.get(nKey);
+                if (nReal == "DISTRICT_CITY_CENTER" || nReal == "DISTRICT_URBAN" || nReal == "DISTRICT_WONDER") {
+                    return true;
+                }
+                const nPinDist = reach.pinDistByKey.get(nKey);
+                return nPinDist !== undefined && nPinDist <= reach.dist;
+            });
+        }
+        // Legacy path (no reach info): any placed tack — this run's or real —
+        // counts as urban, exactly as before TECH_AWARE_CONTIGUITY.
         // An already-urban tile (a building sits there) can take its second
         // building, and the city center can take a building to form the capital
         // quarter — both are directly reachable.
@@ -887,6 +1055,30 @@ class AutoPinPlannerSingleton {
             const d = p?.details?.district;
             return d == "DISTRICT_CITY_CENTER" || d == "DISTRICT_URBAN" || d == "DISTRICT_WONDER";
         });
+    }
+    /**
+     * The 6 neighbor coordinates of a hex plot, via the game's own grid API
+     * (GameplayMap), not DMT — the tech-aware contiguity check (above) needs
+     * to know WHICH specific neighboring tile might be bridging, not just
+     * "is some neighbor urban", so it can look that tile's planned pin up by
+     * coordinate in reach.pinDistByKey.
+     */
+    getHexNeighbors(x, y) {
+        const dirs = [
+            DirectionTypes.DIRECTION_NORTHEAST, DirectionTypes.DIRECTION_EAST,
+            DirectionTypes.DIRECTION_SOUTHEAST, DirectionTypes.DIRECTION_SOUTHWEST,
+            DirectionTypes.DIRECTION_WEST, DirectionTypes.DIRECTION_NORTHWEST,
+        ];
+        const out = [];
+        for (const dir of dirs) {
+            try {
+                const loc = GameplayMap.getAdjacentPlotLocation({ x, y }, dir);
+                if (loc) {
+                    out.push(loc);
+                }
+            } catch (e) { /* defensive: skip on API hiccup */ }
+        }
+        return out;
     }
     /**
      * How much would placing `type` at `plot` improve the yields of existing
@@ -1416,7 +1608,10 @@ class AutoPinPlannerSingleton {
     getIndependentSettlementLocations(centers) {
         const found = [];
         const seen = new Set();
-        const sweepRadius = SETTLE_SEARCH_RADIUS + MIN_SETTLE_DISTANCE;
+        // Swept using IP_SETTLE_SPACING (the distance actually enforced
+        // against independents below), not MIN_SETTLE_DISTANCE, so the two
+        // knobs stay consistent if IP_SETTLE_SPACING is retuned.
+        const sweepRadius = SETTLE_SEARCH_RADIUS + IP_SETTLE_SPACING;
         try {
             for (const center of centers) {
                 const plotIndices = GameplayMap.getPlotIndicesInRadius(center.x, center.y, sweepRadius) || [];
@@ -1442,13 +1637,16 @@ class AutoPinPlannerSingleton {
     getSettleCandidates(centers) {
         const localPlayerID = GameContext.localPlayerID;
         // Spacing must respect every settlement on the map — AI cities, our
-        // planned centers, AND independent-power villages (which aren't
-        // cities and usually own only their own tile).
-        const spacingAnchors = [
+        // planned centers, AND independent-power villages. Real settlements
+        // use MIN_SETTLE_DISTANCE; independents use the separately-tunable
+        // IP_SETTLE_SPACING (see its declaration for why) — this does NOT
+        // hard-forbid settling near independents, it's just the default
+        // spacing, and it can be relaxed without touching real-city spacing.
+        const cityAnchors = [
             ...centers,
-            ...this.getAllSettlementLocations(),
-            ...this.getIndependentSettlementLocations(centers)
+            ...this.getAllSettlementLocations()
         ];
+        const independentAnchors = this.getIndependentSettlementLocations(centers);
         const seen = new Set();
         const candidates = [];
         for (const center of centers) {
@@ -1460,8 +1658,12 @@ class AutoPinPlannerSingleton {
                     continue;
                 }
                 seen.add(key);
-                // Respect settlement spacing against every anchor.
-                if (spacingAnchors.some(c => this.plotDistance(loc.x, loc.y, c.x, c.y) < MIN_SETTLE_DISTANCE)) {
+                // Respect spacing against real settlements...
+                if (cityAnchors.some(c => this.plotDistance(loc.x, loc.y, c.x, c.y) < MIN_SETTLE_DISTANCE)) {
+                    continue;
+                }
+                // ...and independents, at the separately-tunable distance.
+                if (independentAnchors.some(c => this.plotDistance(loc.x, loc.y, c.x, c.y) < IP_SETTLE_SPACING)) {
                     continue;
                 }
                 // Skip other players' territory.
@@ -1512,6 +1714,129 @@ class AutoPinPlannerSingleton {
             const loc = GameplayMap.getLocationFromIndex(plotIndex);
             const d = MapTackUtils.getRealizedPlotDetails(loc.x, loc.y);
             if (d?.resource) { score += 2; }
+        }
+        // Expansion room: open, claimable land further out — reward frontier
+        // spots with space to grow over ones hemmed in by water/mountains/
+        // borders. See expansionRoomScore for the exact criteria.
+        score += this.expansionRoomScore(c);
+        // Natural Wonders and high-appeal (Breathtaking/Charming) tiles
+        // nearby. See wonderAppealScore for the exact criteria/sources.
+        score += this.wonderAppealScore(c);
+        return score;
+    }
+    /**
+     * Expansion-room signal: counts open, claimable land in a radius wider
+     * than cheapSettleScore's own rings (EXPANSION_SEARCH_RADIUS vs. the
+     * 1-ring/2-ring checks above) — room this city could actually grow into
+     * and claim later, not just its immediate tile yields. A tile counts as
+     * "room" if it's not someone else's territory and isn't water/mountain;
+     * resource tiles on that open land count extra since they're the tiles
+     * worth planting improvements on once claimed. Candidates hemmed in by
+     * water, mountains, or a neighbor's borders naturally score lower here
+     * because fewer open tiles exist to count.
+     */
+    expansionRoomScore(c) {
+        let score = 0;
+        try {
+            const localPlayerID = GameContext.localPlayerID;
+            const plotIndices = GameplayMap.getPlotIndicesInRadius(c.x, c.y, EXPANSION_SEARCH_RADIUS) || [];
+            for (const plotIndex of plotIndices) {
+                const loc = GameplayMap.getLocationFromIndex(plotIndex);
+                if (loc.x == c.x && loc.y == c.y) {
+                    continue; // the center tile itself isn't "room to grow into"
+                }
+                // Someone else's territory isn't claimable room.
+                try {
+                    const owner = GameplayMap.getOwner(loc.x, loc.y);
+                    if (owner != null && owner != -1 && owner != localPlayerID) {
+                        continue;
+                    }
+                } catch (e) { /* unowned/fogged is fine — still claimable */ }
+                // Water isn't ownable/workable land for this signal.
+                try {
+                    if (GameplayMap.isWater && GameplayMap.isWater(loc.x, loc.y)) {
+                        continue;
+                    }
+                } catch (e) { /* fine */ }
+                const d = MapTackUtils.getRealizedPlotDetails(loc.x, loc.y);
+                if (d?.terrain == "TERRAIN_MOUNTAIN") {
+                    continue; // unworkable, doesn't count as room
+                }
+                score += EXPANSION_OPEN_TILE_WEIGHT;
+                if (d?.resource) {
+                    score += EXPANSION_RESOURCE_WEIGHT;
+                }
+            }
+        } catch (e) {
+            console.error(`[AutoPin] expansionRoomScore failed: ${e}`);
+        }
+        return score;
+    }
+    /**
+     * Natural Wonder + high-appeal ("Breathtaking"/"Charming") signal near a
+     * candidate.
+     *
+     * CONFIRMED: `details.isNaturalWonder` on DMT's realized plot details is
+     * already relied on elsewhere in this file (matchesWarehouseCondition's
+     * "NaturalWonder" condition), and the engine's own
+     * `GameplayMap.isNaturalWonder(x, y)` is used throughout shipped
+     * base-standard code — checked both ways here so either source missing
+     * still lets the other work.
+     *
+     * BEST-EFFORT / NOT LIVE-VERIFIED: `GameplayMap.getAppeal(x, y)` and the
+     * Breathtaking/Charming thresholds (GlobalParameters
+     * APPEAL_FOR_DOUBLE_HAPPINESS_TILE_YIELD / APPEAL_FOR_HAPPINESS_TILE_YIELD)
+     * are exactly what base-standard's own Appeal lens uses
+     * (ui/lenses/layer/general-appeal-layer.js), confirmed BY READING SHIPPED
+     * GAME CODE, not by running in-game. Wrapped independently of the wonder
+     * check and fails safe (falls back to 0 appeal bonus) if unavailable.
+     */
+    wonderAppealScore(c) {
+        let score = 0;
+        try {
+            const plotIndices = GameplayMap.getPlotIndicesInRadius(c.x, c.y, WONDER_APPEAL_SEARCH_RADIUS) || [];
+            // Read thresholds once per call rather than per tile.
+            let breathtakingThreshold = FALLBACK_BREATHTAKING_APPEAL;
+            let charmingThreshold = FALLBACK_CHARMING_APPEAL;
+            try {
+                const bt = getGlobalParamNumber("APPEAL_FOR_DOUBLE_HAPPINESS_TILE_YIELD");
+                const ct = getGlobalParamNumber("APPEAL_FOR_HAPPINESS_TILE_YIELD");
+                if (Number.isFinite(bt) && bt > -1) { breathtakingThreshold = bt; }
+                if (Number.isFinite(ct) && ct > -1) { charmingThreshold = ct; }
+            } catch (e) { /* keep fallback thresholds */ }
+            for (const plotIndex of plotIndices) {
+                const loc = GameplayMap.getLocationFromIndex(plotIndex);
+                // Natural Wonder proximity — checked two ways since either
+                // source could be absent depending on load order/DMT version.
+                let isWonder = false;
+                try {
+                    const d = MapTackUtils.getRealizedPlotDetails(loc.x, loc.y);
+                    isWonder = !!d?.isNaturalWonder;
+                } catch (e) { /* fine */ }
+                if (!isWonder) {
+                    try {
+                        isWonder = !!(GameplayMap.isNaturalWonder && GameplayMap.isNaturalWonder(loc.x, loc.y));
+                    } catch (e) { /* fine */ }
+                }
+                if (isWonder) {
+                    score += NATURAL_WONDER_WEIGHT;
+                    continue; // don't also double-count this tile's appeal below
+                }
+                // Best-effort appeal read — guarded independently so a
+                // missing/renamed API only drops this bonus, not the wonder one.
+                try {
+                    if (GameplayMap.getAppeal) {
+                        const appeal = GameplayMap.getAppeal(loc.x, loc.y);
+                        if (appeal >= breathtakingThreshold) {
+                            score += BREATHTAKING_APPEAL_WEIGHT;
+                        } else if (appeal >= charmingThreshold) {
+                            score += CHARMING_APPEAL_WEIGHT;
+                        }
+                    }
+                } catch (e) { /* appeal API unavailable — skip this tile's appeal bonus */ }
+            }
+        } catch (e) {
+            console.error(`[AutoPin] wonderAppealScore failed: ${e}`);
         }
         return score;
     }
@@ -1650,6 +1975,14 @@ class AutoPinPlannerSingleton {
         for (const a of GameInfo.Constructible_Adjacencies) {
             adjacencyTypes.add(a.ConstructibleType);
         }
+        // Bridging exception input: does this city currently have a
+        // contiguity gap — a candidate tile the (tech-blind) reachability
+        // check can't yet reach? If every tile is already reachable there's
+        // nothing to bridge, so the warehouse floor stays as-is. Cheap: one
+        // short-circuiting pass over `plots`, reusing the existing (legacy-
+        // mode) isUrbanReachable — this runs once, before any beam/plan work,
+        // so there's no hypothetical-pin contamination to worry about here.
+        const hasContiguityGap = WAREHOUSE_BRIDGE_ENABLE && plots.some(p => !this.isUrbanReachable(p));
         const candidates = [];
         const warehouseRejects = [];
         for (const e of GameInfo.Constructibles) {
@@ -1676,10 +2009,22 @@ class AutoPinPlannerSingleton {
             // complete quarters / bridge the urban network like any building.
             if (!adjacencyTypes.has(type) && !activeUniques.has(type)) {
                 const ws = this.getWarehouseScore(type, plots);
-                if (ws < WAREHOUSE_MIN_SCORE) {
+                const dist = this.techDistance(type);
+                // Bridge exception (see hasContiguityGap above): a buildable-
+                // now (dist 0) placement-agnostic building may still enter
+                // the pool below the floor when there's a contiguity gap to
+                // bridge — it's the cheapest legal way to urbanize a
+                // stepping-stone tile, and unlike a tech-gated building it can
+                // actually be built today. Deeper-tech warehouse buildings get
+                // no exception: they can't bridge anything sooner than a
+                // regular building could.
+                const bridgeEligible = hasContiguityGap && dist == 0;
+                if (ws < WAREHOUSE_MIN_SCORE && !bridgeEligible) {
                     warehouseRejects.push(`${type}=${ws.toFixed(1)}`);
                     continue;
                 }
+                candidates.push({ type, dist });
+                continue;
             }
             candidates.push({ type, dist: this.techDistance(type) });
         }

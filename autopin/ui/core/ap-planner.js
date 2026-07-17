@@ -676,6 +676,16 @@ class AutoPinPlannerSingleton {
         // Plan-stability bias: reuse the same tile for the same building unless
         // a new layout beats it by more than STABILITY_BONUS (M3).
         this.priorAssignment = this.buildPriorAssignment(priorPlan);
+        // The engine's exact "where can each building legally go right now" map
+        // (hash -> Map(plotID -> exact yield)). Computed UP FRONT because it's
+        // the source of truth for what's buildable now — used to seed the
+        // candidate list (getCandidateBuildings), the scorer's exact yields and
+        // legality gate (evaluatePlacements), and isPlaceableNow. null for
+        // planned settlements or if the API is unavailable (heuristic fallback).
+        const placementMap = this.buildPlacementMap(center);
+        this.enginePlacement = placementMap;
+        console.error(`[AutoPin] ${center.x},${center.y} placement source: `
+            + (placementMap ? `engine (${placementMap.size} building types)` : "heuristic (no engine data)"));
         // Phase 1: buildings, planned in waves with an expanding tech horizon.
         // Wave 1 (buildable now) claims the core; later waves widen the pool
         // and — thanks to contiguity — fan outward from what's committed.
@@ -730,15 +740,8 @@ class AutoPinPlannerSingleton {
                 realDistrictByKey.set(`${p.x},${p.y}`, details.district);
             }
         }
-        // The engine's exact "where can each building legally go right now" map
-        // for this city, used by isPlaceableNow to keep the current-turn pins /
-        // gems to placements the game will actually accept. null for planned
-        // settlements or if the API is unavailable (heuristic fallback).
-        const placementMap = this.buildPlacementMap(center);
-        // Also expose it to the scorer (evaluatePlacements) for engine yields.
-        this.enginePlacement = placementMap;
-        console.error(`[AutoPin] ${center.x},${center.y} placement source: `
-            + (placementMap ? `engine (${placementMap.size} building types)` : "heuristic (no engine data)"));
+        // (placementMap / this.enginePlacement were computed up front, before
+        // the candidate list, so getCandidateBuildings can use engine data too.)
         // Phase 1: build the ordered building layout.
         let layout;
         if (USE_LIFETIME_SEQUENCE) {
@@ -918,7 +921,7 @@ class AutoPinPlannerSingleton {
                     // engine-legal tiles PLUS tiles reachable through same-turn
                     // planned pins — the legal frontier grows as the plan grows.
                     if (engineCovers && !engineLegal.has(plotIndex)
-                        && !this.reachableViaPlannedPin(plot.x, plot.y, reach)) {
+                        && !this.reachableViaPlannedPin(plot.x, plot.y, reach, typeDist)) {
                         continue; // illegal now and not reachable via a planned pin
                     }
                     const validStatus = MapTackValidator.isValid(plot.x, plot.y, type);
@@ -1199,17 +1202,17 @@ class AutoPinPlannerSingleton {
      * quarter/bridge tiles the current-state engine snapshot can't see yet.
      * Returns false when there's no planned-pin info (legacy/settle scoring).
      */
-    reachableViaPlannedPin(x, y, reach) {
-        if (!reach || !reach.pinDistByKey) {
+    reachableViaPlannedPin(x, y, reach, dist) {
+        if (!reach || !reach.pinDistByKey || dist === undefined) {
             return false;
         }
         const ownPinDist = reach.pinDistByKey.get(`${x},${y}`);
-        if (ownPinDist !== undefined && ownPinDist <= reach.dist) {
+        if (ownPinDist !== undefined && ownPinDist <= dist) {
             return true;
         }
         return this.getHexNeighbors(x, y).some(loc => {
             const nPinDist = reach.pinDistByKey.get(`${loc.x},${loc.y}`);
-            return nPinDist !== undefined && nPinDist <= reach.dist;
+            return nPinDist !== undefined && nPinDist <= dist;
         });
     }
     /**
@@ -1244,6 +1247,22 @@ class AutoPinPlannerSingleton {
             const d = realDistrictByKey.get(`${loc.x},${loc.y}`);
             return d == "DISTRICT_CITY_CENTER" || d == "DISTRICT_URBAN" || d == "DISTRICT_WONDER";
         });
+    }
+    /**
+     * Does the engine's placement data list `type` as buildable RIGHT NOW (has
+     * at least one legal tile)? The engine is the source of truth for what can
+     * be built, so anything it lists is a valid candidate regardless of
+     * AutoPin's own adjacency/age/unique-trait heuristics. False when there's no
+     * engine data (planned settlement / API absent), so those paths keep using
+     * the heuristic candidate filter.
+     */
+    isEngineBuildable(type) {
+        if (!this.enginePlacement) {
+            return false;
+        }
+        const hash = this.constructibleHash(type);
+        const m = hash != null ? this.enginePlacement.get(hash) : undefined;
+        return !!(m && m.size > 0);
     }
     /**
      * The engine's exact "where can each building legally go RIGHT NOW" map for
@@ -2252,6 +2271,16 @@ class AutoPinPlannerSingleton {
         for (const e of GameInfo.Constructibles) {
             const type = e.ConstructibleType;
             if (e.ConstructibleClass != ConstructibleClassType.BUILDING) {
+                continue;
+            }
+            // Engine-buildable override: the engine's placement query is the
+            // source of truth for what can be built NOW. If it lists this
+            // building with legal tiles, it IS a candidate — bypass the heuristic
+            // exclusions below, which otherwise drop valuable buildings the
+            // engine sees but AutoPin misjudges (University/Inn were vanishing
+            // via the unique-trait/age bookkeeping despite being buildable).
+            if (this.isEngineBuildable(type)) {
+                candidates.push({ type, dist: this.techDistance(type) });
                 continue;
             }
             if (usedTypes.has(type) || ExcludedItems.has(type) || inactiveUniques.has(type)) {

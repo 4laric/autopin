@@ -22,7 +22,8 @@ const GameplayMap = {
 // (constructibleHash). Tests mutate it before constructing a planner.
 function constructiblesTable(rows) {
     return Object.assign([...rows], {
-        lookup(type) { return this.find(c => c.ConstructibleType === type); },
+        // The real GameInfo lookup resolves by type string OR $hash.
+        lookup(key) { return this.find(c => c.ConstructibleType === key || c.$hash === key); },
     });
 }
 const GameInfo = { Constructibles: constructiblesTable([]), Constructible_Adjacencies: [], Yields: [], Buildings: [] };
@@ -178,6 +179,34 @@ const eq = (a, b, m) => ok(JSON.stringify(a) === JSON.stringify(b), `${m} (got $
     ok(!cands.includes('BUILDING_SAWMILL'), 'already-built Sawmill excluded even though the engine reports it');
     ok(cands.includes('BUILDING_UNIVERSITY'), 'buildable University still included via the engine override');
     MapTackUtils._realized = new Map(); // reset shared mock
+}
+
+// === getBuiltTypesInCity — whole-city "already built" gate ==================
+// The YINGTIAN Sawmill bug: a building already in the city (on a full quarter /
+// off-radius tile) is missed by the plot sweep but caught by the city's own
+// constructible list, so it's never re-recommended.
+{
+    GameInfo.Constructibles = constructiblesTable([
+        { ConstructibleType: 'BUILDING_SAWMILL', ConstructibleClass: 'BUILDING', $hash: 1 },
+        { ConstructibleType: 'BUILDING_KILN', ConstructibleClass: 'BUILDING', $hash: 2 },
+    ]);
+    GameInfo.Buildings = [];
+    GameInfo.Constructible_Adjacencies = [];
+    MapTackUtils._realized = new Map(); // nothing on any swept tile
+    // City at (26,8) already contains a Sawmill (hash 1) — reported ONLY by the
+    // city constructible list, not by any tile the sweep touches.
+    globalThis.GameContext = { localPlayerID: 0 };
+    globalThis.Players = { get: () => ({ Cities: { getCities: () => [
+        { location: { x: 26, y: 8 }, Constructibles: { getIds: () => ['id-sawmill'] } },
+    ] } }) };
+    globalThis.Constructibles = { getByComponentID: (id) => id === 'id-sawmill' ? { type: 1 } : null };
+    const p = P();
+    p.enginePlacement = new Map([[2, new Map([[10, 5]])]]); // engine offers Kiln only
+    ok(p.getBuiltTypesInCity({ x: 26, y: 8 }).has('BUILDING_SAWMILL'), 'city list surfaces the built Sawmill');
+    const cands = p.getCandidateBuildings([{ x: 24, y: 9 }], { x: 26, y: 8 }).map(c => c.type);
+    ok(!cands.includes('BUILDING_SAWMILL'), 'already-in-city Sawmill excluded via city-wide usedTypes');
+    ok(cands.includes('BUILDING_KILN'), 'Kiln (not in city, engine-buildable) still a candidate');
+    globalThis.Players = {}; globalThis.Constructibles = undefined; // reset shared globals
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

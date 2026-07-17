@@ -2246,6 +2246,15 @@ class AutoPinPlannerSingleton {
                 usedTypes.add(c);
             }
         }
+        // The sweep above only sees candidate plots — it misses buildings on
+        // tiles outside the radius or on full quarters. Fold in the city's
+        // authoritative constructible list so an already-built building (the
+        // YINGTIAN Sawmill) is never re-recommended.
+        if (center) {
+            for (const t of this.getBuiltTypesInCity(center)) {
+                usedTypes.add(t);
+            }
+        }
         // Unique-building bookkeeping (mirrors DMT's chooser logic).
         const inactiveUniques = new Set();
         const activeUniques = new Set();
@@ -2622,6 +2631,46 @@ class AutoPinPlannerSingleton {
             }
         } catch (e) {
             console.error(`[AutoPin] failed to enumerate built wonders: ${e}`);
+        }
+        return built;
+    }
+    /**
+     * Every constructible type already present in the city at `center` (built OR
+     * in-progress), read from the city's own constructible list — the same
+     * authoritative source the game's UI uses (thisCity.Constructibles.getIds()
+     * -> Constructibles.getByComponentID -> GameInfo lookup).
+     *
+     * usedTypes built from a plot sweep only sees the candidate radius, so a
+     * building on a tile outside it or on a full quarter (e.g. an existing
+     * Sawmill in a developed city) is missed and wrongly re-recommended. This
+     * whole-city read closes that gap. Empty set on any failure (planned
+     * settlement / API absent), so callers fall back to the sweep alone.
+     */
+    getBuiltTypesInCity(center) {
+        const built = new Set();
+        try {
+            const player = Players.get(GameContext.localPlayerID);
+            const cities = player?.Cities?.getCities?.() || [];
+            let city = null;
+            for (const c of cities) {
+                if (c?.location && c.location.x == center.x && c.location.y == center.y) {
+                    city = c;
+                    break;
+                }
+            }
+            const ids = city?.Constructibles?.getIds?.() || [];
+            for (const id of ids) {
+                let def = null;
+                try {
+                    const inst = Constructibles.getByComponentID(id);
+                    def = inst ? GameInfo.Constructibles.lookup(inst.type) : null;
+                } catch (e) { /* unreadable id -> skip */ }
+                if (def?.ConstructibleType) {
+                    built.add(def.ConstructibleType);
+                }
+            }
+        } catch (e) {
+            console.error(`[AutoPin] getBuiltTypesInCity failed: ${e}`);
         }
         return built;
     }

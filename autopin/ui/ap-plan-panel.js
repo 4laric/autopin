@@ -81,6 +81,7 @@ function toggle() {
         close();
         return;
     }
+    const root = document.body || document.documentElement;
     panelEl = document.createElement("div");
     panelEl.innerHTML = buildHtml();
     Object.assign(panelEl.style, {
@@ -91,19 +92,25 @@ function toggle() {
         border: "1px solid #3a5a80", borderRadius: "8px",
         zIndex: "99999", boxShadow: "0 6px 28px rgba(0,0,0,0.55)"
     });
-    document.body.appendChild(panelEl);
+    // Click-to-close: a raw Esc keydown doesn't reach us in Coherent, so give
+    // the panel its own button.
+    const closeBtn = document.createElement("div");
+    closeBtn.textContent = "✕";
+    Object.assign(closeBtn.style, {
+        position: "absolute", top: "8px", right: "12px",
+        cursor: "pointer", opacity: "0.7", fontSize: "16px"
+    });
+    closeBtn.addEventListener("click", close);
+    panelEl.appendChild(closeBtn);
+    root.appendChild(panelEl);
+    console.error(`[AutoPin] plan panel toggled OPEN (root=${root === document.body ? "body" : "documentElement"}, isConnected=${panelEl.isConnected}).`);
 }
 
-// Capture-phase so it works even while a game panel is focused (same trick
-// ap-planner uses for F3/F4/F6). F7 toggles; Esc closes when open.
-window.addEventListener("keydown", (e) => {
-    const key = e?.key || e?.code;
-    if (key == "F7") {
-        try { e.preventDefault(); e.stopPropagation(); } catch (_) { /* ignore */ }
-        toggle();
-    } else if (key == "Escape" && panelEl) {
-        close();
-    }
-}, true);
-
-console.error("[AutoPin] plan panel ready — press F7 to toggle.");
+// Wire to AutoPin's own bound hotkey (F7) via the HotkeyManager chain in
+// ap-hotkey-manager.js -> sendHotkeyEvent -> this window event. Raw keydown on
+// window does NOT fire for unbound keys in Civ's Coherent input, which is why
+// the earlier direct-keydown approach never triggered.
+engine.whenReady.then(() => {
+    window.addEventListener("hotkey-autopin-panel", () => toggle());
+    console.error("[AutoPin] plan panel ready — press F7 to toggle.");
+});

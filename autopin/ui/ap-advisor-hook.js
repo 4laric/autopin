@@ -85,8 +85,17 @@ function plannedTypes() {
 }
 
 // The replacement. Game recommendations ignored entirely; AutoPin's plan wins.
+// The first-call log confirms (a) the chooser actually invokes our override and
+// (b) how many planned building types the plan store returned — so if gems
+// don't show we can tell "not called" from "plan read empty".
+let loggedFirstCall = false;
 AdvisorUtilities.getBuildRecommendationIcons = (_recommendations, type) => {
-    return plannedTypes().has(type) ? [{ class: gemForType(type) }] : [];
+    const planned = plannedTypes();
+    if (!loggedFirstCall) {
+        loggedFirstCall = true;
+        console.error(`[AutoPin] advisor hook first call (type=${type}): ${planned.size} planned type(s) in store.`);
+    }
+    return planned.has(type) ? [{ class: gemForType(type) }] : [];
 };
 
-console.error("[AutoPin] advisor hook installed — production chooser shows AutoPin plan gems.");
+console.error(`[AutoPin] advisor hook installed — ${plannedTypes().size} planned type(s) in store at load.`);

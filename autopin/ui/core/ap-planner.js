@@ -1112,29 +1112,26 @@ class AutoPinPlannerSingleton {
      */
     logOccupiedTileDiagnostic(center, plots, poolTypes) {
         try {
-            const lines = [];
+            let occupied = 0, acceptSecond = 0, centerVerdict = "n/a";
             for (const plot of plots) {
                 const details = MapTackUtils.getRealizedPlotDetails(plot.x, plot.y);
                 const built = details?.constructibles || [];
                 if (built.length == 0) {
-                    continue; // empty tile — not what we're probing
+                    continue;
                 }
-                let verdict = "no pool type testable";
+                occupied++;
+                let accepts = false;
                 for (const type of poolTypes) {
                     let v;
-                    try {
-                        v = MapTackValidator.isValid(plot.x, plot.y, type);
-                    } catch (e) {
-                        continue;
-                    }
-                    verdict = `${type} valid=${v.isValid} prevent=${v.preventPlacement}`;
+                    try { v = MapTackValidator.isValid(plot.x, plot.y, type); } catch (e) { continue; }
+                    accepts = v.isValid && !v.preventPlacement;
                     break; // one representative verdict per tile is enough
                 }
-                const tag = plot.isCenter ? " CENTER" : "";
-                lines.push(`(${plot.x},${plot.y})${tag}[${built.join(",")}] -> ${verdict}`);
+                if (accepts) { acceptSecond++; }
+                if (plot.isCenter) { centerVerdict = accepts ? "accepts a building" : "full/blocked"; }
             }
             console.error(`[AutoPin] ${center.x},${center.y} occupied-tile check: `
-                + (lines.length ? lines.join(" | ") : "no occupied tiles in range"));
+                + `${occupied} occupied, ${acceptSecond} accept another building; center ${centerVerdict}.`);
         } catch (e) {
             console.error(`[AutoPin] occupied-tile diagnostic failed: ${e}`);
         }

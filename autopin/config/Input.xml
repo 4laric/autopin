@@ -4,6 +4,7 @@
         <Row ActionId="autopin-generate" DeviceType="Keyboard" Name="LOC_AUTOPIN_GENERATE" Description="LOC_AUTOPIN_GENERATE_DESCRIPTION"/>
         <Row ActionId="autopin-clear" DeviceType="Keyboard" Name="LOC_AUTOPIN_CLEAR" Description="LOC_AUTOPIN_CLEAR_DESCRIPTION"/>
         <Row ActionId="autopin-settle" DeviceType="Keyboard" Name="LOC_AUTOPIN_SETTLE" Description="LOC_AUTOPIN_SETTLE_DESCRIPTION"/>
+        <Row ActionId="autopin-panel" DeviceType="Keyboard" Name="LOC_AUTOPIN_PANEL" Description="LOC_AUTOPIN_PANEL_DESCRIPTION"/>
     </InputActions>
     <InputContextConstraints>
         <Row ActionId="autopin-generate" ContextId="World"/>
@@ -15,10 +16,14 @@
         <Row ActionId="autopin-settle" ContextId="World"/>
         <Row ActionId="autopin-settle" ContextId="Panel"/>
         <Row ActionId="autopin-settle" ContextId="Unit"/>
+        <Row ActionId="autopin-panel" ContextId="World"/>
+        <Row ActionId="autopin-panel" ContextId="Panel"/>
+        <Row ActionId="autopin-panel" ContextId="Unit"/>
     </InputContextConstraints>
     <InputActionDefaultGestures>
         <Row ActionId="autopin-generate" Index="0" GestureType="KBMouse" GestureData="KEY_F3" />
         <Row ActionId="autopin-clear" Index="0" GestureType="KBMouse" GestureData="KEY_F4" />
         <Row ActionId="autopin-settle" Index="0" GestureType="KBMouse" GestureData="KEY_F6" />
+        <Row ActionId="autopin-panel" Index="0" GestureType="KBMouse" GestureData="KEY_F7" />
     </InputActionDefaultGestures>
 </Database>

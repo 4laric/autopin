@@ -19,5 +19,11 @@
         <Row Tag="LOC_AUTOPIN_SETTLE_DESCRIPTION">
             <Text>Place city-center map tacks at the best nearby settlement locations, ranked by the value of the building plan each spot allows.</Text>
         </Row>
+        <Row Tag="LOC_AUTOPIN_PANEL">
+            <Text>AutoPin: Toggle Plan Panel</Text>
+        </Row>
+        <Row Tag="LOC_AUTOPIN_PANEL_DESCRIPTION">
+            <Text>Show or hide a panel listing AutoPin's build plan for each city.</Text>
+        </Row>
     </EnglishText>
 </Database>

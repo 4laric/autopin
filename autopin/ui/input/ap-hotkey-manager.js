@@ -17,6 +17,7 @@ engine.whenReady.then(() => {
                 case "autopin-generate":
                 case "autopin-clear":
                 case "autopin-settle":
+                case "autopin-panel":
                     HotkeyManager.sendHotkeyEvent(name);
                     return false;
             }

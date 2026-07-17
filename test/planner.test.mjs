@@ -25,10 +25,29 @@ function constructiblesTable(rows) {
         lookup(type) { return this.find(c => c.ConstructibleType === type); },
     });
 }
-const GameInfo = { Constructibles: constructiblesTable([]), Constructible_Adjacencies: [], Yields: [] };
+const GameInfo = { Constructibles: constructiblesTable([]), Constructible_Adjacencies: [], Yields: [], Buildings: [] };
+
+// DMT module mocks (imported by name in ap-planner.js). Mutable so tests can set
+// per-case state — e.g. which tiles already hold a building (getRealizedPlotDetails).
+const MapTackUtils = {
+    _realized: new Map(), // "x,y" -> { constructibles: [...], district }
+    getRealizedPlotDetails(x, y) { return this._realized.get(`${x},${y}`) || null; },
+    getAdjacentPlotDetails() { return []; },
+    isCityCenter: () => false,
+    isObsolete: () => false,
+    isCurrentAge: () => true,
+    isAgeless: () => false,
+    isSlotless: () => false,
+};
+const TraitModifier = { isTraitActive: () => false };
+const ExcludedItems = new Set();
+const ConstructibleClassType = { BUILDING: 'BUILDING' };
 
 const mod = loadPlanner({
-    imports: { Catalog: class { getObject() { return { read: () => '[]', write: () => {} }; } } },
+    imports: {
+        Catalog: class { getObject() { return { read: () => '[]', write: () => {} }; } },
+        MapTackUtils, TraitModifier, ExcludedItems, ConstructibleClassType,
+    },
     globals: { GameInfo, GameplayMap, Players: {}, GameContext: {}, DirectionTypes },
 });
 const P = () => new mod.AutoPinPlannerSingleton();
@@ -137,6 +156,28 @@ const eq = (a, b, m) => ok(JSON.stringify(a) === JSON.stringify(b), `${m} (got $
     ok(p.isEngineBuildable('BUILDING_UNIVERSITY') === true, 'engine lists University with a legal tile -> candidate');
     ok(p.isEngineBuildable('BUILDING_FUTURE') === false, 'engine lists building but no legal tile -> not buildable now');
     ok(p.isEngineBuildable('BUILDING_UNKNOWN') === false, 'building not in engine data -> not buildable');
+}
+
+// === getCandidateBuildings — hard gates beat the engine override ============
+// v27 regression: the engine-buildable rescue ran BEFORE the usedTypes gate, so
+// an already-built building the engine still reported got re-recommended
+// (Sawmill). Built/excluded must always lose, even when the engine lists them.
+{
+    GameInfo.Constructibles = constructiblesTable([
+        { ConstructibleType: 'BUILDING_SAWMILL', ConstructibleClass: 'BUILDING', $hash: 1 },
+        { ConstructibleType: 'BUILDING_UNIVERSITY', ConstructibleClass: 'BUILDING', $hash: 2 },
+    ]);
+    GameInfo.Buildings = [];
+    GameInfo.Constructible_Adjacencies = [];
+    // Sawmill already built on a swept tile; University not built anywhere.
+    MapTackUtils._realized = new Map([['24,9', { constructibles: ['BUILDING_SAWMILL'] }]]);
+    const p = P();
+    // Pathological input: the engine reports BOTH as placeable.
+    p.enginePlacement = new Map([[1, new Map([[10, 5]])], [2, new Map([[11, 5]])]]);
+    const cands = p.getCandidateBuildings([{ x: 24, y: 9 }], { x: 26, y: 8 }).map(c => c.type);
+    ok(!cands.includes('BUILDING_SAWMILL'), 'already-built Sawmill excluded even though the engine reports it');
+    ok(cands.includes('BUILDING_UNIVERSITY'), 'buildable University still included via the engine override');
+    MapTackUtils._realized = new Map(); // reset shared mock
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -915,14 +915,19 @@ class AutoPinPlannerSingleton {
                 const engineCovers = !!(engineLegal && engineLegal.size > 0);
                 for (const plot of reachablePlots) {
                     const plotIndex = this.plotIndexOf(plot.x, plot.y);
-                    // The engine set is a CURRENT-state snapshot, so a tile that
-                    // only becomes reachable via a building placed earlier THIS
-                    // plan (a forward quarter/bridge) won't be in it. Allow the
-                    // engine-legal tiles PLUS tiles reachable through same-turn
-                    // planned pins — the legal frontier grows as the plan grows.
+                    // The engine set is a CURRENT-state snapshot. For a building
+                    // that's buildable NOW (typeDist 0) it's authoritative: the
+                    // engine already accounts for existing urban tiles and
+                    // quarter slots, so a tile it omits is genuinely illegal and
+                    // gets no planned-pin relaxation. (This is what put Kiln onto
+                    // Sawmill's tile: the pin "reached" it, but the engine had
+                    // ruled Kiln couldn't share that quarter.) Relaxation is only
+                    // sound for FUTURE-wave buildings (typeDist > 0) the engine
+                    // can't evaluate yet, whose tiles may urbanize once an
+                    // earlier pin is built — the legal frontier grows with the plan.
                     if (engineCovers && !engineLegal.has(plotIndex)
-                        && !this.reachableViaPlannedPin(plot.x, plot.y, reach, typeDist)) {
-                        continue; // illegal now and not reachable via a planned pin
+                        && (typeDist == 0 || !this.reachableViaPlannedPin(plot.x, plot.y, reach, typeDist))) {
+                        continue; // illegal now and (dist 0, or not reachable via a planned pin)
                     }
                     const validStatus = MapTackValidator.isValid(plot.x, plot.y, type);
                     if (!validStatus.isValid || validStatus.preventPlacement) {
@@ -2278,18 +2283,22 @@ class AutoPinPlannerSingleton {
             if (e.ConstructibleClass != ConstructibleClassType.BUILDING) {
                 continue;
             }
+            // HARD gates first — a building that's already built/pinned or on
+            // DMT's exclude list must never be a candidate, even if the engine
+            // still reports a placement for it (these run BEFORE the engine
+            // override so v27's rescue can't resurrect an already-built Sawmill).
+            if (usedTypes.has(type)) { note(type, "used"); continue; }
+            if (ExcludedItems.has(type)) { note(type, "excludedItem"); continue; }
             // Engine-buildable override: the engine's placement query is the
             // source of truth for what can be built NOW. If it lists this
-            // building with legal tiles, it IS a candidate — bypass the heuristic
-            // exclusions below, which otherwise drop valuable buildings the
-            // engine sees but AutoPin misjudges (University was vanishing via
+            // building with legal tiles, it IS a candidate — bypass the SOFT
+            // heuristic exclusions below, which otherwise drop valuable buildings
+            // the engine sees but AutoPin misjudges (University was vanishing via
             // the unique-trait/age bookkeeping despite being buildable).
             if (this.isEngineBuildable(type)) {
                 candidates.push({ type, dist: this.techDistance(type) });
                 continue;
             }
-            if (usedTypes.has(type)) { note(type, "used"); continue; }
-            if (ExcludedItems.has(type)) { note(type, "excludedItem"); continue; }
             if (inactiveUniques.has(type)) { note(type, "inactiveUnique"); continue; }
             if (MapTackUtils.isCityCenter(type)) { note(type, "cityCenter"); continue; }
             if (MapTackUtils.isObsolete(type)) { note(type, "obsolete"); continue; }

@@ -2268,6 +2268,11 @@ class AutoPinPlannerSingleton {
         const hasContiguityGap = WAREHOUSE_BRIDGE_ENABLE && plots.some(p => !this.isUrbanReachable(p));
         const candidates = [];
         const warehouseRejects = [];
+        // Diagnostic: has-adjacency buildings (which "should" be candidates)
+        // that get excluded, tagged with the reason — this is how we find why a
+        // buildable-looking building like Inn vanishes.
+        const excludedSensitive = [];
+        const note = (type, reason) => { if (adjacencyTypes.has(type)) { excludedSensitive.push(`${type}(${reason})`); } };
         for (const e of GameInfo.Constructibles) {
             const type = e.ConstructibleType;
             if (e.ConstructibleClass != ConstructibleClassType.BUILDING) {
@@ -2277,24 +2282,19 @@ class AutoPinPlannerSingleton {
             // source of truth for what can be built NOW. If it lists this
             // building with legal tiles, it IS a candidate — bypass the heuristic
             // exclusions below, which otherwise drop valuable buildings the
-            // engine sees but AutoPin misjudges (University/Inn were vanishing
-            // via the unique-trait/age bookkeeping despite being buildable).
+            // engine sees but AutoPin misjudges (University was vanishing via
+            // the unique-trait/age bookkeeping despite being buildable).
             if (this.isEngineBuildable(type)) {
                 candidates.push({ type, dist: this.techDistance(type) });
                 continue;
             }
-            if (usedTypes.has(type) || ExcludedItems.has(type) || inactiveUniques.has(type)) {
-                continue;
-            }
-            if (MapTackUtils.isCityCenter(type) || MapTackUtils.isObsolete(type)) {
-                continue;
-            }
-            if (!MapTackUtils.isCurrentAge(type) && !MapTackUtils.isAgeless(type)) {
-                continue;
-            }
-            if (MapTackUtils.isSlotless(type)) {
-                continue; // walls etc. — no building slot, no urban district
-            }
+            if (usedTypes.has(type)) { note(type, "used"); continue; }
+            if (ExcludedItems.has(type)) { note(type, "excludedItem"); continue; }
+            if (inactiveUniques.has(type)) { note(type, "inactiveUnique"); continue; }
+            if (MapTackUtils.isCityCenter(type)) { note(type, "cityCenter"); continue; }
+            if (MapTackUtils.isObsolete(type)) { note(type, "obsolete"); continue; }
+            if (!MapTackUtils.isCurrentAge(type) && !MapTackUtils.isAgeless(type)) { note(type, "wrongAge"); continue; }
+            if (MapTackUtils.isSlotless(type)) { note(type, "slotless"); continue; }
             // Placement-sensitive buildings (adjacencies or uniques) always
             // qualify. Placement-agnostic ones (granary, saw pit) must earn
             // the pin: their warehouse yields in THIS city have to clear the
@@ -2328,6 +2328,12 @@ class AutoPinPlannerSingleton {
         if (warehouseRejects.length) {
             console.error(`[AutoPin] below warehouse floor (${WAREHOUSE_MIN_SCORE}): `
                 + warehouseRejects.join(", "));
+        }
+        // Diagnostic: has-adjacency buildings that were dropped by a structural
+        // gate despite being placement-sensitive (this is how Inn is vanishing).
+        // The (reason) tag says which gate — used/inactiveUnique/wrongAge/etc.
+        if (excludedSensitive.length) {
+            console.error(`[AutoPin] excluded has-adjacency: ${excludedSensitive.join(", ")}`);
         }
         return candidates;
     }

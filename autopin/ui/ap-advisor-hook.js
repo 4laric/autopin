@@ -59,10 +59,14 @@ function gemForType(type) {
     return gem;
 }
 
-// Set of building types that appear anywhere in AutoPin's stored plan. Re-read
-// at most once a second so the chooser's frequent re-renders stay cheap. (MVP:
-// this is empire-wide, not per-open-city — a planned building shows its gem in
-// any city's chooser. Per-city precision is a later refinement.)
+// Set of building types AutoPin recommends building NOW: those in the stored
+// plan whose tile is a legal placement in the current game state
+// (rec.placeableNow — set by the planner). We deliberately skip buildings that
+// are still waiting on a bridge, so the menu never gems a building you can't
+// actually place on AutoPin's tile yet. Re-read at most once a second so the
+// chooser's frequent re-renders stay cheap. (MVP: empire-wide, not per-open-
+// city — a placeable building shows its gem in any city's chooser. Per-city
+// precision is a later refinement.)
 let plannedCache = null;
 let plannedAt = 0;
 function plannedTypes() {
@@ -74,7 +78,7 @@ function plannedTypes() {
     try {
         const raw = new Catalog(CATALOG).getObject(OBJECT).read(KEY_PLAN_FULL);
         for (const rec of (JSON.parse(raw) || [])) {
-            if (rec && rec.type) {
+            if (rec && rec.type && rec.placeableNow) {
                 set.add(rec.type);
             }
         }

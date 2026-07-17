@@ -65,7 +65,7 @@ function buildHtml() {
         html += `</ol>`;
     }
     html += `<div style="margin-top:10px;opacity:0.5;font-size:12px;">`
-        + `★ anchor · ● pinned · ○ planned — F7 or Esc to close</div>`;
+        + `● buildable now · ○ waiting (bridge/tech) · ★ anchor — F7 or Esc to close</div>`;
     return html;
 }
 

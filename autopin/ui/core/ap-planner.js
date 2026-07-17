@@ -104,6 +104,14 @@ const WINDOW_SIZE = 8;
 // forever — pin them even when they sit deep in the sequence, so the reserved
 // tile is visible now. (Wonders are always pinned in their own phase.)
 const PIN_AGELESS_ANCHORS = true;
+// Only physically pin (and gem) a building whose tile is a LEGAL placement in
+// the CURRENT game state — reachable through tiles that are really built now,
+// not through planned-but-unbuilt bridge pins. A building waiting on a bridge
+// stays in the stored plan (F7 panel) but off the map/menu until you build the
+// bridge and re-run F3, so AutoPin never recommends a tile the game won't let
+// you build on yet. false = fall back to the near-term window regardless of
+// current legality.
+const PIN_ONLY_PLACEABLE_NOW = true;
 // Plan-stability bias. On re-plan (F3), a building scored on the SAME tile it
 // occupied in the stored plan gets this bonus, so a new layout has to beat the
 // old placement by more than a rounding error to move it. Keeps quarters from
@@ -730,11 +738,21 @@ class AutoPinPlannerSingleton {
         let order = 0;
         for (const pin of layout) {
             const anchor = PIN_AGELESS_ANCHORS && this.isAgelessType(pin.type);
-            const doPin = order < windowLimit || anchor;
+            // Current-state placeability: a building is legally placeable RIGHT
+            // NOW only if it's buildable (tech distance 0) AND its tile is
+            // reachable through tiles that are really built now (not through
+            // planned bridge pins). This is what "respect the game's placement
+            // rules" means — a tile still waiting on a bridge isn't a legal
+            // placement, so it's kept in the plan but not pinned/gemmed yet.
+            const dist = pin.dist ?? distByType.get(pin.type) ?? 0;
+            const placeableNow = dist === 0 && this.isPlaceableNow(pin.x, pin.y, realDistrictByKey);
+            const doPin = PIN_ONLY_PLACEABLE_NOW
+                ? placeableNow
+                : (order < windowLimit || anchor);
             const rec = {
                 x: pin.x, y: pin.y, type: pin.type,
                 order, eta: etaSlots.get(pin.type) ?? 0,
-                anchor, pinned: doPin, cx: center.x, cy: center.y
+                anchor, placeableNow, pinned: doPin, cx: center.x, cy: center.y
             };
             if (doPin) {
                 this.placePin(pin);
@@ -1079,6 +1097,25 @@ class AutoPinPlannerSingleton {
             } catch (e) { /* defensive: skip on API hiccup */ }
         }
         return out;
+    }
+    /**
+     * Is this tile a legal building placement in the CURRENT game state — i.e.
+     * reachable through tiles that are REALLY built right now (the district
+     * snapshot taken at the top of planCity), ignoring any planned-but-unbuilt
+     * pins? Unlike isUrbanReachable's tech-aware mode (which lets the plan
+     * bridge through pins it intends to build later), this asks only "could the
+     * player legally drop this building here THIS turn". Used to keep the map
+     * pins / gems to placements the game will actually accept now.
+     */
+    isPlaceableNow(x, y, realDistrictByKey) {
+        const own = realDistrictByKey.get(`${x},${y}`);
+        if (own == "DISTRICT_URBAN" || own == "DISTRICT_CITY_CENTER") {
+            return true; // occupied tile with a free slot, or the city center
+        }
+        return this.getHexNeighbors(x, y).some(loc => {
+            const d = realDistrictByKey.get(`${loc.x},${loc.y}`);
+            return d == "DISTRICT_CITY_CENTER" || d == "DISTRICT_URBAN" || d == "DISTRICT_WONDER";
+        });
     }
     /**
      * How much would placing `type` at `plot` improve the yields of existing

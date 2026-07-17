@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<Mod id="autopin" version="18" xmlns="ModInfo">
+<Mod id="autopin" version="20" xmlns="ModInfo">
     <Properties>
         <Name>LOC_MOD_AUTOPIN_NAME</Name>
         <Description>LOC_MOD_AUTOPIN_DESCRIPTION</Description>
@@ -39,17 +39,6 @@
                     <Item>ui/ap-plan-panel.js</Item>
                     <Item>ui/options/editors/ap-editor-keyboard-mapping-decorator.js</Item>
                 </UIScripts>
-                <!-- Register the input actions in GAME scope too. Applying
-                     Input.xml only in shell scope (above) fails: the frontend
-                     database has no World/Panel/Unit input contexts, so the
-                     InputContextConstraints rows hit a FOREIGN KEY error and the
-                     whole file rolls back — which is why newly-added actions
-                     like autopin-panel (F7) never register and the game never
-                     forwards the key. In game scope those contexts exist, so
-                     this applies cleanly and the actions actually bind. -->
-                <UpdateDatabase>
-                    <Item>config/Input.xml</Item>
-                </UpdateDatabase>
                 <UpdateText>
                     <Item>text/en_us/InputText.xml</Item>
                     <Item>text/en_us/UIText.xml</Item>

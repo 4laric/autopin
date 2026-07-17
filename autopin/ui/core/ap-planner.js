@@ -126,6 +126,11 @@ const PIN_ONLY_PLACEABLE_NOW = false;
 // lookup falls back to the isUrbanReachable-style heuristic automatically.
 // false = always use the heuristic.
 const USE_ENGINE_PLACEMENT = true;
+// After an F3 generate, pop the plan panel. F7 can't be bound (its input action
+// won't register — see the modinfo notes), and the game only forwards keys for
+// registered actions, so no new key can trigger the panel; F3 IS registered, so
+// it doubles as "plan + show the plan". Set false to keep the panel hidden.
+const SHOW_PANEL_ON_GENERATE = true;
 // Plan-stability bias. On re-plan (F3), a building scored on the SAME tile it
 // occupied in the stored plan gets this bonus, so a new layout has to beat the
 // old placement by more than a rounding error to move it. Keeps quarters from
@@ -377,6 +382,12 @@ class AutoPinPlannerSingleton {
             console.error(`[AutoPin] generate failed: ${e}\n${e?.stack}`);
         } finally {
             this.runBannerEnd("generate");
+        }
+        // Surface the plan panel after planning — F3 is the reliable trigger
+        // (F7 can't bind). The panel script listens for this event.
+        if (SHOW_PANEL_ON_GENERATE) {
+            try { window.dispatchEvent(new CustomEvent("autopin-show-panel")); }
+            catch (e) { /* panel script not loaded */ }
         }
     }
     generateForAll() {

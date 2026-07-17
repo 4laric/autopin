@@ -51,21 +51,27 @@ function buildHtml() {
     if (byCity.size == 0) {
         html += `<div style="opacity:0.7;">No plan stored yet. Select a city and press F3.</div>`;
     }
+    // Coherent's font only renders the filled circle (&#9679;), not ★/○/✕, so
+    // we distinguish states by COLOR of the same dot: gold = buildable this
+    // turn, cyan = permanent anchor, grey = waiting on a bridge or tech.
+    const DOT = "&#9679;";
+    const colorFor = (r) => r.anchor ? "#8fd0ff" : (r.placeableNow ? "#ffd479" : "#7a8a99");
     for (const [city, recs] of byCity) {
         recs.sort((a, b) => a.order - b.order);
-        html += `<div style="margin:10px 0 4px;font-weight:600;color:#cfe;">City @ ${city}</div>`;
-        html += `<ol style="margin:0;padding-left:20px;line-height:1.5;">`;
+        if (byCity.size > 1) {
+            html += `<div style="margin:10px 0 4px;font-weight:600;color:#cfe;">City @ ${city}</div>`;
+        }
         for (const r of recs) {
             const when = r.eta > 0 ? `+${r.eta}` : "now";
-            // ★ = pinned anchor, ● = pinned (window), ○ = planned tail (not pinned)
-            const mark = r.pinned ? (r.anchor ? "★" : "●") : "○";
-            html += `<li><span style="color:#ffd479;">${mark}</span> ${shortName(r.type)} `
-                + `<span style="opacity:0.55;font-size:12px;">(${r.x},${r.y}) · ${when}</span></li>`;
+            html += `<div style="margin:3px 0;">`
+                + `<span style="color:${colorFor(r)};">${DOT}</span> ${shortName(r.type)} `
+                + `<span style="opacity:0.5;font-size:12px;">(${r.x},${r.y}) &middot; ${when}</span></div>`;
         }
-        html += `</ol>`;
     }
-    html += `<div style="margin-top:10px;opacity:0.5;font-size:12px;">`
-        + `● buildable now · ○ waiting (bridge/tech) · ★ anchor — F7 or Esc to close</div>`;
+    html += `<div style="margin-top:12px;opacity:0.6;font-size:12px;border-top:1px solid #2a3a4a;padding-top:6px;">`
+        + `<span style="color:#ffd479;">${DOT}</span> now &nbsp;`
+        + `<span style="color:#7a8a99;">${DOT}</span> waiting &nbsp;`
+        + `<span style="color:#8fd0ff;">${DOT}</span> anchor<br>F3 refreshes &middot; X closes</div>`;
     return html;
 }
 
@@ -82,10 +88,10 @@ function renderInto(el) {
     // Click-to-close: a raw Esc keydown doesn't reach us in Coherent, so give
     // the panel its own button.
     const closeBtn = document.createElement("div");
-    closeBtn.textContent = "✕";
+    closeBtn.textContent = "X"; // plain letter — Coherent's font has no ✕ glyph
     Object.assign(closeBtn.style, {
-        position: "absolute", top: "8px", right: "12px",
-        cursor: "pointer", opacity: "0.7", fontSize: "16px"
+        position: "absolute", top: "6px", right: "12px",
+        cursor: "pointer", opacity: "0.6", fontSize: "15px", fontWeight: "700"
     });
     closeBtn.addEventListener("click", close);
     el.appendChild(closeBtn);

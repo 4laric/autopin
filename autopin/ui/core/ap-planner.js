@@ -126,6 +126,14 @@ const PIN_ONLY_PLACEABLE_NOW = false;
 // lookup falls back to the isUrbanReachable-style heuristic automatically.
 // false = always use the heuristic.
 const USE_ENGINE_PLACEMENT = true;
+// Score a currently-buildable building's tile with the ENGINE'S exact yield
+// (from the same placement query) instead of DMT's adjacency estimate. DMT
+// misses specialist/quarter/some-adjacency yields, so it lands buildings like
+// the University on a worse tile than the game's own numbers would — this
+// closes that gap for the tiles the engine covers (current-state legal tiles).
+// Buildings/tiles the engine doesn't cover (future-tech, bridged) still use the
+// DMT estimate. Requires USE_ENGINE_PLACEMENT. false = always DMT scoring.
+const USE_ENGINE_YIELDS = true;
 // After an F3 generate, pop the plan panel. F7 can't be bound (its input action
 // won't register — see the modinfo notes), and the game only forwards keys for
 // registered actions, so no new key can trigger the panel; F3 IS registered, so
@@ -294,6 +302,9 @@ class AutoPinPlannerSingleton {
         // Per-city set of Ageless/unique building types, read by
         // evaluatePlacements for the permanence premium (M4). Same lifecycle.
         this.premiumTypes = null;
+        // Per-city engine placement map (hash -> Map(plotID -> exact yield)),
+        // read by evaluatePlacements/isPlaceableNow. Same lifecycle.
+        this.enginePlacement = null;
         engine.whenReady.then(() => { this.onReady(); });
     }
     onReady() {
@@ -527,6 +538,7 @@ class AutoPinPlannerSingleton {
             this.gatewayCount = null;
             this.priorAssignment = null;
             this.premiumTypes = null;
+            this.enginePlacement = null;
             this.clearPins(KEY_SETTLE_LIST);
             const cityCenterType = this.getCityCenterType();
             if (!cityCenterType) {
@@ -720,6 +732,8 @@ class AutoPinPlannerSingleton {
         // gems to placements the game will actually accept. null for planned
         // settlements or if the API is unavailable (heuristic fallback).
         const placementMap = this.buildPlacementMap(center);
+        // Also expose it to the scorer (evaluatePlacements) for engine yields.
+        this.enginePlacement = placementMap;
         console.error(`[AutoPin] ${center.x},${center.y} placement source: `
             + (placementMap ? `engine (${placementMap.size} building types)` : "heuristic (no engine data)"));
         // Phase 1: build the ordered building layout.
@@ -828,6 +842,7 @@ class AutoPinPlannerSingleton {
         // Don't leak this city's per-plan biases into the next city / settle scan.
         this.priorAssignment = null;
         this.premiumTypes = null;
+        this.enginePlacement = null;
         return { pinned, full };
     }
     findBestPlacement(pool, plots, useMutual = true) {
@@ -884,30 +899,49 @@ class AutoPinPlannerSingleton {
                         continue;
                     }
                     const yieldDetails = MapTackYield.getYieldDetails(plot.x, plot.y, type);
-                    let score = this.scoreYields(yieldDetails);
-                    // Warehouse yields (granary & co) — same on every tile,
-                    // but they make the building competitive at all.
-                    let warehouseScore = warehouseScores.get(type);
-                    if (warehouseScore === undefined) {
-                        warehouseScore = this.getWarehouseScore(type, plots);
-                        warehouseScores.set(type, warehouseScore);
+                    // Placement VALUE. Prefer the ENGINE's exact net-yield delta
+                    // when it covers this (building, tile): it already folds in
+                    // the tile's own yields, all adjacencies (specialist/quarter
+                    // included), and the rural yield it displaces — so it stands
+                    // in for the DMT estimate + warehouse + mutual + urbanize
+                    // cost. DMT sum is the fallback for tiles/buildings the
+                    // engine doesn't cover (future-tech, bridged).
+                    let score;
+                    let engineScore;
+                    if (USE_ENGINE_YIELDS && this.enginePlacement) {
+                        const hash = this.constructibleHash(type);
+                        engineScore = hash != null
+                            ? this.enginePlacement.get(hash)?.get(this.plotIndexOf(plot.x, plot.y))
+                            : undefined;
                     }
-                    score += warehouseScore;
-                    if (useMutual) {
-                        // Mutual adjacency: value this pin adds to already-placed neighbors.
-                        score += this.mutualAdjacencyDelta(plot, type, validStatus, baselineScores);
+                    if (engineScore !== undefined) {
+                        score = engineScore;
+                    } else {
+                        score = this.scoreYields(yieldDetails);
+                        // Warehouse yields (granary & co) — same on every tile,
+                        // but they make the building competitive at all.
+                        let warehouseScore = warehouseScores.get(type);
+                        if (warehouseScore === undefined) {
+                            warehouseScore = this.getWarehouseScore(type, plots);
+                            warehouseScores.set(type, warehouseScore);
+                        }
+                        score += warehouseScore;
+                        if (useMutual) {
+                            // Mutual adjacency: value this pin adds to already-placed neighbors.
+                            score += this.mutualAdjacencyDelta(plot, type, validStatus, baselineScores);
+                        }
+                        // Opportunity cost: placing a building on a rural tile
+                        // destroys its improvement — subtract the yields the tile
+                        // currently produces (a garden that nets +1 food -2 gold
+                        // over a farm shouldn't score like +4 food gross).
+                        const plotKey = `${plot.x}-${plot.y}`;
+                        let urbanizeCost = urbanizeCosts.get(plotKey);
+                        if (urbanizeCost === undefined) {
+                            urbanizeCost = this.getUrbanizeCost(plot);
+                            urbanizeCosts.set(plotKey, urbanizeCost);
+                        }
+                        score -= urbanizeCost;
                     }
-                    // Opportunity cost: placing a building on a rural tile
-                    // destroys its improvement — subtract the yields the tile
-                    // currently produces (a garden that nets +1 food -2 gold
-                    // over a farm shouldn't score like +4 food gross).
-                    const plotKey = `${plot.x}-${plot.y}`;
-                    let urbanizeCost = urbanizeCosts.get(plotKey);
-                    if (urbanizeCost === undefined) {
-                        urbanizeCost = this.getUrbanizeCost(plot);
-                        urbanizeCosts.set(plotKey, urbanizeCost);
-                    }
-                    score -= urbanizeCost;
                     // M4 permanence premium: scale a permanent (Ageless/unique)
                     // building's value up so it wins the best tiles; otherwise
                     // add the small overbuild-fodder bias so a throwaway building
@@ -1202,15 +1236,34 @@ class AutoPinPlannerSingleton {
             if (!data?.buildings) {
                 return null;
             }
+            // Weight per yield index — placement.yieldChanges is an array
+            // indexed by GameInfo.Yields.$index, so the engine's EXACT per-tile
+            // yields (adjacencies, specialists, quarters and all) can be scored
+            // with AutoPin's own yield weights instead of DMT's estimate.
+            const yieldWeight = [];
+            try {
+                for (const yd of GameInfo.Yields) {
+                    yieldWeight[yd.$index] = YIELD_WEIGHTS[yd.YieldType] ?? 1;
+                }
+            } catch (e) { /* no yields table -> weights default to 1 below */ }
+            // hash -> Map(plotID -> weighted engine yield). A Map (not a Set) so
+            // isPlaceableNow can still .has(plotID) AND the scorer can .get() the
+            // exact yield for legal tiles.
             const map = new Map();
             for (const b of data.buildings) {
-                const set = new Set();
+                const byPlot = new Map();
                 for (const pl of (b.placements || [])) {
-                    if (pl?.plotID != null) {
-                        set.add(pl.plotID);
+                    if (pl?.plotID == null) {
+                        continue;
                     }
+                    let s = 0;
+                    const yc = pl.yieldChanges || [];
+                    for (let i = 0; i < yc.length; i++) {
+                        s += (yc[i] || 0) * (yieldWeight[i] ?? 1);
+                    }
+                    byPlot.set(pl.plotID, s);
                 }
-                map.set(b.constructibleType, set);
+                map.set(b.constructibleType, byPlot);
             }
             return map;
         } catch (e) {

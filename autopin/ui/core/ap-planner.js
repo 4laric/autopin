@@ -893,30 +893,45 @@ class AutoPinPlannerSingleton {
             for (const type of pool) {
                 const reachablePlots = reachablePlotsFor(type);
                 const typeDist = reach ? (reach.distByType?.get(type) ?? 0) : undefined;
+                // Engine legality/yield for this building: a Map(plotID -> exact
+                // yield) of its LEGAL tiles right now, or undefined if the engine
+                // doesn't cover it. When it DOES (the building is currently
+                // buildable somewhere), ONLY those tiles are allowed — this hard-
+                // skips the outright-illegal spots DMT's validator misses.
+                // Future-tech / nothing-legal-yet buildings have no engine set
+                // and fall through to the DMT + contiguity approximation so
+                // forward planning still works.
+                let engineLegal;
+                if (USE_ENGINE_PLACEMENT && this.enginePlacement) {
+                    const hash = this.constructibleHash(type);
+                    engineLegal = hash != null ? this.enginePlacement.get(hash) : undefined;
+                }
+                const engineCovers = !!(engineLegal && engineLegal.size > 0);
                 for (const plot of reachablePlots) {
+                    const plotIndex = this.plotIndexOf(plot.x, plot.y);
+                    // The engine set is a CURRENT-state snapshot, so a tile that
+                    // only becomes reachable via a building placed earlier THIS
+                    // plan (a forward quarter/bridge) won't be in it. Allow the
+                    // engine-legal tiles PLUS tiles reachable through same-turn
+                    // planned pins — the legal frontier grows as the plan grows.
+                    if (engineCovers && !engineLegal.has(plotIndex)
+                        && !this.reachableViaPlannedPin(plot.x, plot.y, reach)) {
+                        continue; // illegal now and not reachable via a planned pin
+                    }
                     const validStatus = MapTackValidator.isValid(plot.x, plot.y, type);
                     if (!validStatus.isValid || validStatus.preventPlacement) {
                         continue;
                     }
                     const yieldDetails = MapTackYield.getYieldDetails(plot.x, plot.y, type);
-                    // Placement VALUE. Prefer the ENGINE's exact net-yield delta
-                    // when it covers this (building, tile): it already folds in
-                    // the tile's own yields, all adjacencies (specialist/quarter
-                    // included), and the rural yield it displaces — so it stands
-                    // in for the DMT estimate + warehouse + mutual + urbanize
-                    // cost. DMT sum is the fallback for tiles/buildings the
-                    // engine doesn't cover (future-tech, bridged).
+                    // Placement VALUE: the engine's exact yield for the legal
+                    // tiles it covers (folds in adjacencies, specialists, quarters
+                    // and the displaced rural yield); DMT sum for everything else
+                    // (future-tech / bridged tiles the engine can't price yet).
                     let score;
-                    let engineScore;
-                    if (USE_ENGINE_YIELDS && this.enginePlacement) {
-                        const hash = this.constructibleHash(type);
-                        engineScore = hash != null
-                            ? this.enginePlacement.get(hash)?.get(this.plotIndexOf(plot.x, plot.y))
-                            : undefined;
+                    if (USE_ENGINE_YIELDS && engineCovers) {
+                        score = engineLegal.get(plotIndex);
                     }
-                    if (engineScore !== undefined) {
-                        score = engineScore;
-                    } else {
+                    if (score === undefined) {
                         score = this.scoreYields(yieldDetails);
                         // Warehouse yields (granary & co) — same on every tile,
                         // but they make the building competitive at all.
@@ -1172,6 +1187,27 @@ class AutoPinPlannerSingleton {
             } catch (e) { /* defensive: skip on API hiccup */ }
         }
         return out;
+    }
+    /**
+     * Is (x,y) reachable via a PLANNED pin — a building placed earlier in this
+     * beam layout — whose tech distance is <= reach.dist (same-turn-or-earlier)?
+     * This is the "grows as the plan grows" half of contiguity, kept separate
+     * from the real-urban half so the engine legality gate can allow the forward
+     * quarter/bridge tiles the current-state engine snapshot can't see yet.
+     * Returns false when there's no planned-pin info (legacy/settle scoring).
+     */
+    reachableViaPlannedPin(x, y, reach) {
+        if (!reach || !reach.pinDistByKey) {
+            return false;
+        }
+        const ownPinDist = reach.pinDistByKey.get(`${x},${y}`);
+        if (ownPinDist !== undefined && ownPinDist <= reach.dist) {
+            return true;
+        }
+        return this.getHexNeighbors(x, y).some(loc => {
+            const nPinDist = reach.pinDistByKey.get(`${loc.x},${loc.y}`);
+            return nPinDist !== undefined && nPinDist <= reach.dist;
+        });
     }
     /**
      * Can `type` be LEGALLY placed on (x,y) in the CURRENT game state? This is

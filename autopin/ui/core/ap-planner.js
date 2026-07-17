@@ -379,9 +379,10 @@ class AutoPinPlannerSingleton {
     }
     generate() {
         this.runBanner("generate");
+        let selected = null;
         try {
             // With a city selected, re-plan just that city; otherwise, all.
-            const selected = this.getSelectedCityCenter();
+            selected = this.getSelectedCityCenter();
             if (selected) {
                 console.error(`[AutoPin] selected city detected at ${selected.x},${selected.y} — planning that city only.`);
                 this.generateForCenter(selected);
@@ -397,7 +398,9 @@ class AutoPinPlannerSingleton {
         // Surface the plan panel after planning — F3 is the reliable trigger
         // (F7 can't bind). The panel script listens for this event.
         if (SHOW_PANEL_ON_GENERATE) {
-            try { window.dispatchEvent(new CustomEvent("autopin-show-panel")); }
+            // Tell the panel which city was just planned so it shows THAT city's
+            // plan (or all cities when none was selected — generateForAll).
+            try { window.dispatchEvent(new CustomEvent("autopin-show-panel", { detail: { city: selected } })); }
             catch (e) { /* panel script not loaded */ }
         }
     }

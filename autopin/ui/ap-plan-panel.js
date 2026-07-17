@@ -18,6 +18,9 @@ const OBJECT = "AUTOPIN_PINS";
 const KEY_PLAN_FULL = "planfull";
 
 let panelEl = null;
+// When set to {x,y}, the panel shows only that city's plan (the city just
+// planned via F3); null shows every city's plan, grouped.
+let filterCity = null;
 
 function readPlan() {
     try {
@@ -28,19 +31,24 @@ function readPlan() {
     }
 }
 
-// BUILDING_LIBRARY -> "Library"; WONDER_* gets a marker.
+// BUILDING_LIBRARY -> "library"; WONDER_MENAGERIE -> "menagerie" (its cyan
+// anchor dot marks it as a wonder; the ✦ glyph is tofu in Coherent's font).
 function shortName(type) {
     const t = String(type || "");
     if (t.startsWith("WONDER_")) {
-        return "✦ " + t.replace(/^WONDER_/, "").replace(/_/g, " ").toLowerCase();
+        return t.replace(/^WONDER_/, "").replace(/_/g, " ").toLowerCase();
     }
     return t.replace(/^BUILDING_/, "").replace(/_/g, " ").toLowerCase();
 }
 
 function buildHtml() {
     const plan = readPlan();
+    // Narrow to the selected / just-planned city when we have one.
+    const records = filterCity
+        ? plan.filter(r => r.cx == filterCity.x && r.cy == filterCity.y)
+        : plan;
     const byCity = new Map();
-    for (const r of plan) {
+    for (const r of records) {
         const key = `${r.cx},${r.cy}`;
         if (!byCity.has(key)) {
             byCity.set(key, []);
@@ -49,7 +57,9 @@ function buildHtml() {
     }
     let html = `<div style="font-weight:700;font-size:15px;margin-bottom:8px;color:#8fd0ff;">AutoPin — Build Plan</div>`;
     if (byCity.size == 0) {
-        html += `<div style="opacity:0.7;">No plan stored yet. Select a city and press F3.</div>`;
+        html += filterCity
+            ? `<div style="opacity:0.7;">No plan for this city yet — press F3 with it selected.</div>`
+            : `<div style="opacity:0.7;">No plan stored yet. Select a city and press F3.</div>`;
     }
     // Coherent's font only renders the filled circle (&#9679;), not ★/○/✕, so
     // we distinguish states by COLOR of the same dot: gold = buildable this
@@ -131,8 +141,13 @@ function refreshOrOpen() {
 let lastToggleAt = 0;
 engine.whenReady.then(() => {
     // F3 (generate) fires this after planning — the reliable trigger, since F3
-    // is a registered hotkey. This is the main way the panel appears.
-    window.addEventListener("autopin-show-panel", () => refreshOrOpen());
+    // is a registered hotkey. This is the main way the panel appears. The
+    // planner passes the city it just planned so we show THAT city's plan
+    // (detail.city null = generateForAll -> show every city, grouped).
+    window.addEventListener("autopin-show-panel", (e) => {
+        filterCity = e?.detail?.city ?? null;
+        refreshOrOpen();
+    });
     // F7 toggle, kept in case the input action ever registers. Raw keydown on
     // window does NOT fire for unbound keys in Civ's Coherent input, so this
     // only works if the bound-action path delivers it.

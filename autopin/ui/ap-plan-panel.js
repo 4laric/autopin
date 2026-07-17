@@ -110,7 +110,18 @@ function toggle() {
 // ap-hotkey-manager.js -> sendHotkeyEvent -> this window event. Raw keydown on
 // window does NOT fire for unbound keys in Civ's Coherent input, which is why
 // the earlier direct-keydown approach never triggered.
+let lastToggleAt = 0;
 engine.whenReady.then(() => {
-    window.addEventListener("hotkey-autopin-panel", () => toggle());
+    window.addEventListener("hotkey-autopin-panel", () => {
+        // Debounce: F7 can arrive via both the input-action hotkey AND the
+        // ap-planner keydown fallback — ignore a second trigger within 300ms so
+        // the panel doesn't open-then-immediately-close on one press.
+        const now = Date.now();
+        if (now - lastToggleAt < 300) {
+            return;
+        }
+        lastToggleAt = now;
+        toggle();
+    });
     console.error("[AutoPin] plan panel ready — press F7 to toggle.");
 });

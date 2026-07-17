@@ -104,14 +104,28 @@ const WINDOW_SIZE = 8;
 // forever — pin them even when they sit deep in the sequence, so the reserved
 // tile is visible now. (Wonders are always pinned in their own phase.)
 const PIN_AGELESS_ANCHORS = true;
-// Only physically pin (and gem) a building whose tile is a LEGAL placement in
-// the CURRENT game state — reachable through tiles that are really built now,
-// not through planned-but-unbuilt bridge pins. A building waiting on a bridge
-// stays in the stored plan (F7 panel) but off the map/menu until you build the
-// bridge and re-run F3, so AutoPin never recommends a tile the game won't let
-// you build on yet. false = fall back to the near-term window regardless of
-// current legality.
-const PIN_ONLY_PLACEABLE_NOW = true;
+// Two recommendation surfaces, deliberately different:
+//  - MAP PINS show the FORWARD PLAN (a near-term window of the sequence plus
+//    anchors), so you can see the city developing ahead of the tech tree —
+//    buildable-now buildings claim real tiles first (via the discount order),
+//    future buildings extend out as the city expands and tech advances.
+//  - Production-menu GEMS always track placeableNow (see the advisor hook /
+//    rec.placeableNow), so the menu never recommends a building you can't
+//    legally place THIS turn. Plan on the map, act in the menu.
+// This flag only affects the MAP: false = forward plan (default); true =
+// restrict the map to placeable-now too (myopic — pins == gems).
+const PIN_ONLY_PLACEABLE_NOW = false;
+// Ground "placeable now" in the ENGINE'S OWN answer rather than AutoPin's
+// contiguity heuristic: city.Yields.calculateAllBuildingsPlacements() returns,
+// per building, the exact set of legal plots for the current game state (the
+// same query the game's placement UI uses). This makes the current-turn pins
+// and gems match the game's real rules (quarters, overbuild, terrain, blocked
+// resources, unique quarters) instead of approximating them. Forward planning
+// still uses the contiguity model — the engine query is current-state only.
+// If the API is unavailable (planned settlement, or a patch renames it) each
+// lookup falls back to the isUrbanReachable-style heuristic automatically.
+// false = always use the heuristic.
+const USE_ENGINE_PLACEMENT = true;
 // Plan-stability bias. On re-plan (F3), a building scored on the SAME tile it
 // occupied in the stored plan gets this bonus, so a new layout has to beat the
 // old placement by more than a rounding error to move it. Keeps quarters from
@@ -321,6 +335,15 @@ class AutoPinPlannerSingleton {
         if (name == "generate") { this.generate(); }
         else if (name == "clear") { this.clearAll(); }
         else if (name == "settle") { this.suggestSettlements(); }
+        else if (name == "panel") {
+            // Toggle the plan panel by firing the same window event its own
+            // listener waits on. Routed through this proven keydown path
+            // because the autopin-panel input action doesn't reliably register
+            // (Input.xml rolls back in shell scope), so its dedicated hotkey
+            // event never fires.
+            try { window.dispatchEvent(new CustomEvent("hotkey-autopin-panel")); }
+            catch (e) { console.error(`[AutoPin] panel toggle dispatch failed: ${e}`); }
+        }
     }
     /**
      * Capture-phase keydown fallback. The input-action system doesn't deliver
@@ -330,7 +353,7 @@ class AutoPinPlannerSingleton {
      */
     onKeyDown(e) {
         const key = e?.key || e?.code;
-        const map = { F3: "generate", F4: "clear", F6: "settle" };
+        const map = { F3: "generate", F4: "clear", F6: "settle", F7: "panel" };
         const action = map[key];
         if (!action) {
             return;
@@ -681,6 +704,13 @@ class AutoPinPlannerSingleton {
                 realDistrictByKey.set(`${p.x},${p.y}`, details.district);
             }
         }
+        // The engine's exact "where can each building legally go right now" map
+        // for this city, used by isPlaceableNow to keep the current-turn pins /
+        // gems to placements the game will actually accept. null for planned
+        // settlements or if the API is unavailable (heuristic fallback).
+        const placementMap = this.buildPlacementMap(center);
+        console.error(`[AutoPin] ${center.x},${center.y} placement source: `
+            + (placementMap ? `engine (${placementMap.size} building types)` : "heuristic (no engine data)"));
         // Phase 1: build the ordered building layout.
         let layout;
         if (USE_LIFETIME_SEQUENCE) {
@@ -738,14 +768,14 @@ class AutoPinPlannerSingleton {
         let order = 0;
         for (const pin of layout) {
             const anchor = PIN_AGELESS_ANCHORS && this.isAgelessType(pin.type);
-            // Current-state placeability: a building is legally placeable RIGHT
-            // NOW only if it's buildable (tech distance 0) AND its tile is
-            // reachable through tiles that are really built now (not through
-            // planned bridge pins). This is what "respect the game's placement
-            // rules" means — a tile still waiting on a bridge isn't a legal
-            // placement, so it's kept in the plan but not pinned/gemmed yet.
+            // Current-state placeability (engine-grounded): buildable this turn
+            // (tech distance 0) AND its tile is a legal placement in the engine's
+            // own placement data right now. Stored on the record so the advisor
+            // hook can keep the production-menu GEMS to placeable-now buildings —
+            // regardless of whether the building is on the map as a forward pin.
             const dist = pin.dist ?? distByType.get(pin.type) ?? 0;
-            const placeableNow = dist === 0 && this.isPlaceableNow(pin.x, pin.y, realDistrictByKey);
+            const placeableNow = dist === 0 && this.isPlaceableNow(pin.type, pin.x, pin.y, placementMap, realDistrictByKey);
+            // Map pins follow the forward-plan window (see PIN_ONLY_PLACEABLE_NOW).
             const doPin = PIN_ONLY_PLACEABLE_NOW
                 ? placeableNow
                 : (order < windowLimit || anchor);
@@ -1099,15 +1129,29 @@ class AutoPinPlannerSingleton {
         return out;
     }
     /**
-     * Is this tile a legal building placement in the CURRENT game state — i.e.
-     * reachable through tiles that are REALLY built right now (the district
-     * snapshot taken at the top of planCity), ignoring any planned-but-unbuilt
-     * pins? Unlike isUrbanReachable's tech-aware mode (which lets the plan
-     * bridge through pins it intends to build later), this asks only "could the
-     * player legally drop this building here THIS turn". Used to keep the map
-     * pins / gems to placements the game will actually accept now.
+     * Can `type` be LEGALLY placed on (x,y) in the CURRENT game state? This is
+     * the current-turn recommendation gate — it asks "would the game let the
+     * player drop this building here THIS turn", not "could the plan bridge to
+     * it later" (that's isUrbanReachable's job during forward planning).
+     *
+     * Exact path: `placementMap` is the engine's own answer
+     * (calculateAllBuildingsPlacements — see buildPlacementMap), so quarters,
+     * overbuild, terrain, blocked resources and unique-quarter rules are all
+     * accounted for by the game itself. Fallback (planned settlement, or the
+     * API unavailable): the isUrbanReachable-style contiguity heuristic over
+     * the real-district snapshot.
      */
-    isPlaceableNow(x, y, realDistrictByKey) {
+    isPlaceableNow(type, x, y, placementMap, realDistrictByKey) {
+        if (placementMap) {
+            const hash = this.constructibleHash(type);
+            if (hash != null) {
+                const legalPlots = placementMap.get(hash);
+                // Building present in the engine data -> trust it exactly; a
+                // building absent from the data can't be placed at all now.
+                return legalPlots ? legalPlots.has(this.plotIndexOf(x, y)) : false;
+            }
+            // Unknown hash: fall through to the heuristic rather than blocking.
+        }
         const own = realDistrictByKey.get(`${x},${y}`);
         if (own == "DISTRICT_URBAN" || own == "DISTRICT_CITY_CENTER") {
             return true; // occupied tile with a free slot, or the city center
@@ -1116,6 +1160,86 @@ class AutoPinPlannerSingleton {
             const d = realDistrictByKey.get(`${loc.x},${loc.y}`);
             return d == "DISTRICT_CITY_CENTER" || d == "DISTRICT_URBAN" || d == "DISTRICT_WONDER";
         });
+    }
+    /**
+     * The engine's exact "where can each building legally go RIGHT NOW" map for
+     * the real city at `center`, from city.Yields.calculateAllBuildingsPlacements()
+     * — the same query the game's own placement UI runs. Returns a Map keyed by
+     * constructible $hash -> Set of legal plot indices, or null when there's no
+     * real city there (a planned settlement tack) or the API/data is missing,
+     * in which case isPlaceableNow falls back to the contiguity heuristic.
+     */
+    buildPlacementMap(center) {
+        if (!USE_ENGINE_PLACEMENT) {
+            return null;
+        }
+        try {
+            const player = Players.get(GameContext.localPlayerID);
+            const cities = player?.Cities?.getCities?.() || [];
+            let city = null;
+            for (const c of cities) {
+                if (c?.location && c.location.x == center.x && c.location.y == center.y) {
+                    city = c;
+                    break;
+                }
+            }
+            const calc = city?.Yields?.calculateAllBuildingsPlacements;
+            if (typeof calc != "function") {
+                return null; // planned settlement, or API absent -> heuristic
+            }
+            const data = calc.call(city.Yields);
+            if (!data?.buildings) {
+                return null;
+            }
+            const map = new Map();
+            for (const b of data.buildings) {
+                const set = new Set();
+                for (const pl of (b.placements || [])) {
+                    if (pl?.plotID != null) {
+                        set.add(pl.plotID);
+                    }
+                }
+                map.set(b.constructibleType, set);
+            }
+            return map;
+        } catch (e) {
+            console.error(`[AutoPin] buildPlacementMap failed (falling back to heuristic): ${e}`);
+            return null;
+        }
+    }
+    /**
+     * $hash for a constructible type string (what the placement data is keyed
+     * by), memoized. Returns undefined if it can't be resolved.
+     */
+    constructibleHash(type) {
+        if (!this._hashCache) {
+            this._hashCache = new Map();
+        }
+        if (this._hashCache.has(type)) {
+            return this._hashCache.get(type);
+        }
+        let hash;
+        try {
+            hash = GameInfo.Constructibles.lookup(type)?.$hash;
+        } catch (e) {
+            hash = undefined;
+        }
+        this._hashCache.set(type, hash);
+        return hash;
+    }
+    /**
+     * Plot index for (x,y), used to match against the engine placement data's
+     * plotID. -1 if the coordinate can't be indexed.
+     */
+    plotIndexOf(x, y) {
+        try {
+            if (GameplayMap.getIndexFromXY) {
+                return GameplayMap.getIndexFromXY(x, y);
+            }
+            return GameplayMap.getIndexFromLocation({ x, y });
+        } catch (e) {
+            return -1;
+        }
     }
     /**
      * How much would placing `type` at `plot` improve the yields of existing

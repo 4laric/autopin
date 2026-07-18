@@ -55,7 +55,8 @@ function buildHtml() {
         }
         byCity.get(key).push(r);
     }
-    let html = `<div style="font-weight:700;font-size:15px;margin-bottom:8px;color:#8fd0ff;">AutoPin — Build Plan</div>`;
+    // Title lives in the header row (renderInto), so content starts at the body.
+    let html = "";
     if (byCity.size == 0) {
         html += filterCity
             ? `<div style="opacity:0.7;">No plan for this city yet — press F3 with it selected.</div>`
@@ -81,7 +82,7 @@ function buildHtml() {
     html += `<div style="margin-top:12px;opacity:0.6;font-size:12px;border-top:1px solid #2a3a4a;padding-top:6px;">`
         + `<span style="color:#ffd479;">${DOT}</span> now &nbsp;`
         + `<span style="color:#7a8a99;">${DOT}</span> waiting &nbsp;`
-        + `<span style="color:#8fd0ff;">${DOT}</span> anchor<br>F3 refreshes &middot; X closes</div>`;
+        + `<span style="color:#8fd0ff;">${DOT}</span> anchor<br>F3 refreshes &middot; CLOSE button dismisses</div>`;
     return html;
 }
 
@@ -92,31 +93,60 @@ function close() {
     }
 }
 
-// Fill (or refill) a panel element with the current plan + a close button.
+// Fill (or refill) a panel element with a header (title + close) and the plan.
 function renderInto(el) {
-    el.innerHTML = buildHtml();
-    // Click-to-close: a raw Esc keydown doesn't reach us in Coherent, so give
-    // the panel its own button.
-    const closeBtn = document.createElement("div");
-    closeBtn.textContent = "X"; // plain letter — Coherent's font has no ✕ glyph
-    Object.assign(closeBtn.style, {
-        position: "absolute", top: "6px", right: "12px",
-        cursor: "pointer", opacity: "0.6", fontSize: "15px", fontWeight: "700"
+    el.innerHTML = "";
+    // Header row: title on the left, a REAL close button on the right. Both are
+    // in the normal flow (flexbox) — unlike the old absolutely-positioned "X",
+    // which sat at the panel's right edge and got clipped off-screen when the
+    // panel hugged the viewport edge, so it couldn't be clicked. The button has
+    // a generous hit area, pointer-events forced on, and both click + pointerdown
+    // handlers (Coherent doesn't always deliver `click` to plain elements). The
+    // log line confirms whether the activation even routes to us.
+    const header = document.createElement("div");
+    Object.assign(header.style, {
+        display: "flex", alignItems: "center", justifyContent: "space-between",
+        gap: "10px", marginBottom: "8px"
     });
-    closeBtn.addEventListener("click", close);
-    el.appendChild(closeBtn);
+    const title = document.createElement("div");
+    title.textContent = "AutoPin — Build Plan";
+    Object.assign(title.style, { fontWeight: "700", fontSize: "15px", color: "#8fd0ff" });
+    const closeBtn = document.createElement("div");
+    closeBtn.textContent = "CLOSE"; // word, not a glyph — Coherent's font has no ✕
+    Object.assign(closeBtn.style, {
+        cursor: "pointer", fontSize: "12px", fontWeight: "700", color: "#ffd479",
+        background: "rgba(255,212,121,0.14)", border: "1px solid #6a5a30",
+        borderRadius: "6px", padding: "7px 14px", userSelect: "none",
+        pointerEvents: "auto", flex: "0 0 auto"
+    });
+    const doClose = (ev) => {
+        if (ev) { ev.stopPropagation(); ev.preventDefault(); }
+        console.error("[AutoPin] panel CLOSE activated.");
+        close();
+    };
+    closeBtn.addEventListener("click", doClose);
+    closeBtn.addEventListener("pointerdown", doClose);
+    header.appendChild(title);
+    header.appendChild(closeBtn);
+    el.appendChild(header);
+    const body = document.createElement("div");
+    body.innerHTML = buildHtml();
+    el.appendChild(body);
 }
 
 function open() {
     const root = document.body || document.documentElement;
     panelEl = document.createElement("div");
     Object.assign(panelEl.style, {
-        position: "fixed", top: "80px", right: "24px",
+        position: "fixed", top: "80px", right: "40px",
         width: "330px", maxHeight: "72vh", overflowY: "auto",
         background: "rgba(10,20,35,0.95)", color: "#e8e8e8",
         font: "14px 'Segoe UI', sans-serif", padding: "14px 16px",
         border: "1px solid #3a5a80", borderRadius: "8px",
-        zIndex: "99999", boxShadow: "0 6px 28px rgba(0,0,0,0.55)"
+        zIndex: "99999", boxShadow: "0 6px 28px rgba(0,0,0,0.55)",
+        // Force interactivity: if any ancestor UI layer defaults pointer-events
+        // off, the CLOSE button would silently swallow no clicks.
+        pointerEvents: "auto"
     });
     renderInto(panelEl);
     root.appendChild(panelEl);

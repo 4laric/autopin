@@ -230,5 +230,36 @@ const eq = (a, b, m) => ok(JSON.stringify(a) === JSON.stringify(b), `${m} (got $
     ok(p.enginePlotsFor('BUILDING_GUILDHALL', legal) === plots, 'result memoized per hash for the plan');
 }
 
+// === isEngineLegalAt — authoritative legality gate (beam + relocation) ======
+// The Temple bug: the relocation pass moved a buildable-now building onto a tile
+// the engine never listed (DMT's validator wrongly OK'd it). This gate is what
+// both the beam and relocation now consult.
+{
+    GameInfo.Constructibles = constructiblesTable([{ ConstructibleType: 'BUILDING_TEMPLE', $hash: 5 }]);
+    const p = P();
+    ok(p.isEngineLegalAt('BUILDING_TEMPLE', 8, 7) === null, 'no engine data -> null (defer to DMT)');
+    p.enginePlacement = new Map([[5, new Map([[GameplayMap.getIndexFromXY(8, 7), 10]])]]);
+    ok(p.isEngineLegalAt('BUILDING_TEMPLE', 8, 7) === true, 'engine-legal tile -> true');
+    ok(p.isEngineLegalAt('BUILDING_TEMPLE', 11, 7) === false, 'off-legal tile -> false (relocation blocked here)');
+    p.enginePlacement = new Map([[5, new Map()]]);
+    ok(p.isEngineLegalAt('BUILDING_TEMPLE', 8, 7) === null, 'engine covers type with no tiles -> null (defer)');
+}
+
+// === isUnplaceableNow — don't DMT-place engine-omitted buildable-now types ===
+// The Factory bug: in a full Modern city the engine lists no legal tile for
+// Factory (fresh or overbuild), yet DMT force-placed it on an illegal tile.
+{
+    GameInfo.Constructibles = constructiblesTable([
+        { ConstructibleType: 'BUILDING_FACTORY', $hash: 9 },
+        { ConstructibleType: 'BUILDING_MUSEUM', $hash: 10 },
+    ]);
+    const p = P();
+    ok(p.isUnplaceableNow('BUILDING_FACTORY', 0) === false, 'no engine data -> not skipped (defer to DMT)');
+    p.enginePlacement = new Map([[10, new Map([[5, 3]])]]); // Museum covered, Factory omitted
+    ok(p.isUnplaceableNow('BUILDING_FACTORY', 0) === true, 'buildable-now but engine-omitted -> unplaceable (skip DMT)');
+    ok(p.isUnplaceableNow('BUILDING_MUSEUM', 0) === false, 'engine-covered building -> placeable');
+    ok(p.isUnplaceableNow('BUILDING_FACTORY', 2) === false, 'future building (dist>0) -> exempt (keeps forward planning)');
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

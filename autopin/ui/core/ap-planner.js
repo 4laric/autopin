@@ -847,6 +847,7 @@ class AutoPinPlannerSingleton {
             wondersRemaining--;
         }
         this.logBuildOrder(center, full);
+        this.logEngineTopTiles(full);
         // Don't leak this city's per-plan biases into the next city / settle scan.
         this.priorAssignment = null;
         this.premiumTypes = null;
@@ -914,6 +915,16 @@ class AutoPinPlannerSingleton {
                     engineLegal = hash != null ? this.enginePlacement.get(hash) : undefined;
                 }
                 const engineCovers = !!(engineLegal && engineLegal.size > 0);
+                // A buildable-now building the engine won't place ANYWHERE has no
+                // legal tile this turn. The engine's data already includes both
+                // fresh tiles AND overbuilds (each placement carries an
+                // overbuiltConstructibleID), so "omitted" means genuinely nowhere
+                // — not "overbuild wasn't considered". Don't let DMT's looser
+                // validator invent a tile: that put Factory on an illegal spot in
+                // a full Modern city. Future buildings (dist>0) stay exempt.
+                if (this.isUnplaceableNow(type, typeDist)) {
+                    continue;
+                }
                 // Candidate tiles. For engine-covered (buildable-now) buildings,
                 // score EVERY tile the engine calls legal — INCLUDING ones beyond
                 // CITY_RADIUS — instead of the radius-limited contiguity pool,
@@ -952,6 +963,19 @@ class AutoPinPlannerSingleton {
                     let score;
                     if (USE_ENGINE_YIELDS && engineCovers) {
                         score = engineLegal.get(plotIndex);
+                        // Mutual adjacency: the yield this pin ADDS to already-
+                        // placed neighbours. The engine's number is the building's
+                        // own yield only, so without this an engine-priced
+                        // (buildable-now) building under-competes with DMT-priced
+                        // FUTURE buildings — which DO get this credit — for a tile
+                        // ringed by other buildings. That asymmetry let future
+                        // pins squat on current buildings' best tiles (Guildhall
+                        // bumped off a 20-score tile onto a 10-score one). Same
+                        // call, same terms as the DMT branch below, so the two
+                        // price on a common basis.
+                        if (useMutual) {
+                            score += this.mutualAdjacencyDelta(plot, type, validStatus, baselineScores);
+                        }
                     }
                     if (score === undefined) {
                         score = this.scoreYields(yieldDetails);
@@ -1281,6 +1305,41 @@ class AutoPinPlannerSingleton {
         return !!(m && m.size > 0);
     }
     /**
+     * Is (x,y) an engine-legal placement for `type` right now?
+     *   true  — the engine covers this type AND lists this tile (legal).
+     *   false — the engine covers this type but NOT this tile (illegal — must
+     *           not place here, however much DMT's validator likes it).
+     *   null  — the engine doesn't cover this type (future/uncovered); the
+     *           caller should fall back to its own (DMT) legality check.
+     * The engine is the game's own placement query, so where it covers a type
+     * its answer is authoritative — this is the single gate the beam AND the
+     * relocation pass consult so neither can drop a building on a tile the game
+     * would reject (a Temple on an un-bridged, non-buildable tile).
+     */
+    isEngineLegalAt(type, x, y) {
+        if (!this.enginePlacement) {
+            return null;
+        }
+        const legal = this.enginePlacement.get(this.constructibleHash(type));
+        if (!legal || legal.size === 0) {
+            return null; // engine doesn't cover this type -> defer to caller
+        }
+        return legal.has(this.plotIndexOf(x, y));
+    }
+    /**
+     * A building that's buildable-NOW by tech (typeDist 0) but that the engine
+     * doesn't cover has NO legal tile this turn — the engine is the game's own
+     * placement query, so if it lists nothing, nothing is legal. DMT must NOT
+     * invent a tile for it: that's how Factory (and Brickyard before it) landed
+     * on an illegal tile in a full city where every legal slot was taken. Future
+     * buildings (typeDist > 0) the engine can't price yet are exempt — they keep
+     * the DMT/contiguity approximation for forward planning. Only fires when we
+     * actually have engine data (a real city, not a planned settlement).
+     */
+    isUnplaceableNow(type, typeDist) {
+        return !!this.enginePlacement && typeDist === 0 && !this.isEngineBuildable(type);
+    }
+    /**
      * The engine's legal tiles for an engine-covered building as {x,y} plot
      * objects (converted from plotID). This is the placement candidate set for
      * buildable-now buildings, so we weigh EVERY tile the engine allows — even
@@ -1581,6 +1640,15 @@ class AutoPinPlannerSingleton {
             return s;
         };
         const validAt = (type, x, y) => {
+            // Engine-covered buildings: the engine's legal set is law. Without
+            // this, a swap could relocate a buildable-now building onto a tile
+            // DMT's validator accepts but the game rejects — exactly how a Temple
+            // ended up on a non-buildable, un-bridged (11,7). Uncovered/future
+            // buildings (null) fall back to the DMT validator as before.
+            const eng = this.isEngineLegalAt(type, x, y);
+            if (eng !== null) {
+                return eng;
+            }
             try {
                 const v = MapTackValidator.isValid(x, y, type);
                 return v.isValid && !v.preventPlacement;
@@ -1681,12 +1749,52 @@ class AutoPinPlannerSingleton {
                     flag = ",!OFF_LEGAL";
                 }
             }
-            return `${i + 1}. ${r.type} @ (${r.x},${r.y}) [${when},${tag}${flag}]`;
+            // s = the DISCOUNTED score this pin was committed at (raw *
+            // gamma^slotTime) — the currency the beam actually allocates tiles
+            // by. Comparing a now-building's s against a future-building's s on
+            // the SAME tile shows whether the time-discount is making the right
+            // reservation, or whether future/DMT scores are on a different scale.
+            const s = (r.score != null) ? ` s=${r.score.toFixed(1)}` : "";
+            return `${i + 1}. ${r.type} @ (${r.x},${r.y}) [${when},${tag}${flag}]${s}`;
         }).join(" · ");
         const pinnedCount = full.filter(r => r.pinned).length;
         console.error(`[AutoPin] ${center.x},${center.y} build order (${full.length}, ${pinnedCount} pinned): ${line || "empty"}`);
     }
 
+    /**
+     * Diagnostic: for each buildable-now pinned building, rank ITS engine-legal
+     * tiles by the engine's weighted yield and show the top few, marking the one
+     * AutoPin chose (*). If a clearly higher-scoring tile exists but wasn't
+     * chosen, that's a selection bug; if the "good spot" a player expected isn't
+     * in the list at all, the engine never considered it legal for that type.
+     */
+    logEngineTopTiles(full) {
+        if (!this.enginePlacement) {
+            return;
+        }
+        for (const r of full) {
+            if (r.eta !== 0) {
+                continue; // only buildable-now buildings have engine yields
+            }
+            const legal = this.enginePlacement.get(this.constructibleHash(r.type));
+            if (!legal || legal.size === 0) {
+                continue;
+            }
+            const chosen = `${r.x},${r.y}`;
+            const ranked = [...legal.entries()]
+                .map(([pid, s]) => {
+                    let l;
+                    try { l = GameplayMap.getLocationFromIndex(pid); } catch (e) { l = null; }
+                    return l ? { key: `${l.x},${l.y}`, s } : null;
+                })
+                .filter(Boolean)
+                .sort((a, b) => b.s - a.s)
+                .slice(0, 5)
+                .map(t => `(${t.key})=${t.s.toFixed(1)}${t.key === chosen ? "*" : ""}`)
+                .join(" ");
+            console.error(`[AutoPin] ${r.type} engine tiles (top5): ${ranked} | chose (${chosen})`);
+        }
+    }
     /**
      * Warehouse yield definitions per constructible (granary's "+food from
      * farms in this settlement" and friends), cached from the game database.

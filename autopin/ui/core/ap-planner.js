@@ -684,6 +684,8 @@ class AutoPinPlannerSingleton {
         // planned settlements or if the API is unavailable (heuristic fallback).
         const placementMap = this.buildPlacementMap(center);
         this.enginePlacement = placementMap;
+        this._planCenter = center;
+        this._enginePlotsCache = new Map(); // plotID->{x,y} conversions for this plan
         console.error(`[AutoPin] ${center.x},${center.y} placement source: `
             + (placementMap ? `engine (${placementMap.size} building types)` : "heuristic (no engine data)"));
         // Phase 1: buildings, planned in waves with an expanding tech horizon.
@@ -897,7 +899,6 @@ class AutoPinPlannerSingleton {
                 return cached;
             };
             for (const type of pool) {
-                const reachablePlots = reachablePlotsFor(type);
                 const typeDist = reach ? (reach.distByType?.get(type) ?? 0) : undefined;
                 // Engine legality/yield for this building: a Map(plotID -> exact
                 // yield) of its LEGAL tiles right now, or undefined if the engine
@@ -913,6 +914,16 @@ class AutoPinPlannerSingleton {
                     engineLegal = hash != null ? this.enginePlacement.get(hash) : undefined;
                 }
                 const engineCovers = !!(engineLegal && engineLegal.size > 0);
+                // Candidate tiles. For engine-covered (buildable-now) buildings,
+                // score EVERY tile the engine calls legal — INCLUDING ones beyond
+                // CITY_RADIUS — instead of the radius-limited contiguity pool,
+                // which was hiding better peripheral tiles (a 17-gold border tile
+                // losing to an Arena overbuild because AutoPin never saw it).
+                // Future/uncovered buildings keep the reachability approximation
+                // so forward planning still works.
+                const reachablePlots = engineCovers
+                    ? this.enginePlotsFor(type, engineLegal)
+                    : reachablePlotsFor(type);
                 for (const plot of reachablePlots) {
                     const plotIndex = this.plotIndexOf(plot.x, plot.y);
                     // The engine set is a CURRENT-state snapshot. For a building
@@ -1268,6 +1279,35 @@ class AutoPinPlannerSingleton {
         const hash = this.constructibleHash(type);
         const m = hash != null ? this.enginePlacement.get(hash) : undefined;
         return !!(m && m.size > 0);
+    }
+    /**
+     * The engine's legal tiles for an engine-covered building as {x,y} plot
+     * objects (converted from plotID). This is the placement candidate set for
+     * buildable-now buildings, so we weigh EVERY tile the engine allows — even
+     * ones past CITY_RADIUS — rather than the radius-limited contiguity pool.
+     * Memoized per constructible hash for the life of the current plan (the
+     * cache is reset whenever enginePlacement is recomputed, in planCity).
+     */
+    enginePlotsFor(type, engineLegal) {
+        const hash = this.constructibleHash(type);
+        if (this._enginePlotsCache?.has(hash)) {
+            return this._enginePlotsCache.get(hash);
+        }
+        const out = [];
+        for (const plotID of engineLegal.keys()) {
+            let loc;
+            try {
+                loc = GameplayMap.getLocationFromIndex(plotID);
+            } catch (e) {
+                loc = null;
+            }
+            if (loc) {
+                const isCenter = this._planCenter && loc.x == this._planCenter.x && loc.y == this._planCenter.y;
+                out.push({ x: loc.x, y: loc.y, owned: true, isCenter: !!isCenter });
+            }
+        }
+        this._enginePlotsCache?.set(hash, out);
+        return out;
     }
     /**
      * The engine's exact "where can each building legally go RIGHT NOW" map for
@@ -1627,7 +1667,21 @@ class AutoPinPlannerSingleton {
         const line = full.map((r, i) => {
             const when = r.eta > 0 ? `+${r.eta}` : "now";
             const tag = r.pinned ? (r.anchor ? "pin*" : "pin") : "plan";
-            return `${i + 1}. ${r.type} @ (${r.x},${r.y}) [${when},${tag}]`;
+            // Diagnostic: does the engine actually consider this tile legal for
+            // this type right now? "!ENGINE_OMITS" = the engine returned no
+            // placements for the type (so it fell back to DMT's validator, which
+            // can accept illegal tiles); "!OFF_LEGAL" = engine covers the type
+            // but this specific tile isn't in its legal set. Blank = legal/ok.
+            let flag = "";
+            if (r.eta === 0 && this.enginePlacement) {
+                const legal = this.enginePlacement.get(this.constructibleHash(r.type));
+                if (!legal || legal.size === 0) {
+                    flag = ",!ENGINE_OMITS";
+                } else if (!legal.has(this.plotIndexOf(r.x, r.y))) {
+                    flag = ",!OFF_LEGAL";
+                }
+            }
+            return `${i + 1}. ${r.type} @ (${r.x},${r.y}) [${when},${tag}${flag}]`;
         }).join(" · ");
         const pinnedCount = full.filter(r => r.pinned).length;
         console.error(`[AutoPin] ${center.x},${center.y} build order (${full.length}, ${pinnedCount} pinned): ${line || "empty"}`);

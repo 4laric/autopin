@@ -17,6 +17,7 @@ const HEX = [[0, 1], [1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1]];
 const GameplayMap = {
     getAdjacentPlotLocation({ x, y }, dir) { const [dx, dy] = HEX[dir]; return { x: x + dx, y: y + dy }; },
     getIndexFromXY(x, y) { return y * 1000 + x; },
+    getLocationFromIndex(idx) { return { x: idx % 1000, y: Math.floor(idx / 1000) }; },
 };
 // GameInfo.Constructibles must be iterable (getBuildingCost) AND have .lookup
 // (constructibleHash). Tests mutate it before constructing a planner.
@@ -207,6 +208,26 @@ const eq = (a, b, m) => ok(JSON.stringify(a) === JSON.stringify(b), `${m} (got $
     ok(!cands.includes('BUILDING_SAWMILL'), 'already-in-city Sawmill excluded via city-wide usedTypes');
     ok(cands.includes('BUILDING_KILN'), 'Kiln (not in city, engine-buildable) still a candidate');
     globalThis.Players = {}; globalThis.Constructibles = undefined; // reset shared globals
+}
+
+// === enginePlotsFor — engine legal tiles become candidate plots city-wide ===
+// The Guildhall bug: a better tile beyond CITY_RADIUS was never scored because
+// the candidate pool was radius-limited. Engine-covered buildings must consider
+// every legal tile the engine returns, however far from center.
+{
+    GameInfo.Constructibles = constructiblesTable([{ ConstructibleType: 'BUILDING_GUILDHALL', $hash: 7 }]);
+    const p = P();
+    p._planCenter = { x: 12, y: 10 };
+    p._enginePlotsCache = new Map();
+    const legal = new Map([
+        [GameplayMap.getIndexFromXY(11, 9), 5],   // near center
+        [GameplayMap.getIndexFromXY(17, 3), 20],  // far border tile (outside radius 3)
+    ]);
+    const plots = p.enginePlotsFor('BUILDING_GUILDHALL', legal);
+    eq(plots.map(pl => `${pl.x},${pl.y}`).sort(), ['11,9', '17,3'],
+        'engine legal tiles -> plots, including the far border tile past CITY_RADIUS');
+    ok(plots.every(pl => pl.owned === true), 'engine-legal plots are marked owned');
+    ok(p.enginePlotsFor('BUILDING_GUILDHALL', legal) === plots, 'result memoized per hash for the plan');
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
